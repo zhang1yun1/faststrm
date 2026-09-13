@@ -1,0 +1,101 @@
+name: Sync Upstream & Release Kodi Addon
+
+on:
+  schedule:
+    - cron: '28 * * * *' # 每 1 小时检查一次上游更新
+  workflow_dispatch: # 支持在 GitHub Web 界面手动一键触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: go
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with Upstream & Check Updates
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/wabisabi926/faststrm.git || true
+          git fetch upstream go
+
+          NEW_COMMITS_COUNT=$(git rev-list --count HEAD..upstream/go)
+          echo "New commits count from upstream: ${NEW_COMMITS_COUNT}"
+
+          # 判断上游代码变动（如果是定时触发且新 Commit 数量为 0 则跳过打包）
+          if [ "${NEW_COMMITS_COUNT}" -eq 0 ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "No new commits from upstream. Skipping build and release."
+            echo "has_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "New updates detected (${NEW_COMMITS_COUNT} commits, or manually triggered). Merging upstream code..."
+            if ! git merge upstream/go --no-edit -X theirs --allow-unrelated-histories; then
+              echo "Merge encountered conflicts, aborting merge to preserve local files..."
+              git merge --abort || true
+            fi
+            git push origin go || echo "No changes to push or push skipped."
+            echo "has_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Go Environment
+        if: steps.sync.outputs.has_update == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install Build Tools
+        if: steps.sync.outputs.has_update == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip curl
+
+      - name: Run Kodi Addon Build Script (ARM64)
+        if: steps.sync.outputs.has_update == 'true'
+        run: |
+          chmod +x ./build_kodi_addon.sh
+          echo "Building ARM64 package for CoreELEC..."
+          ./build_kodi_addon.sh arm64
+
+      - name: Determine Version and Locate Assets
+        if: steps.sync.outputs.has_update == 'true'
+        id: get_info
+        run: |
+          VERSION="v1.3.1"
+          ZIP_SRC=$(ls dist/service.faststrm-*-arm64.zip | head -n 1)
+          if [ -f "${ZIP_SRC}" ]; then
+            KODI_VER=$(unzip -p "${ZIP_SRC}" "service.faststrm/addon.xml" | grep '<addon ' | sed -n 's/.*version="\([^"]*\)".*/\1/p')
+            if [ -n "${KODI_VER}" ]; then
+              VERSION="v${KODI_VER}"
+            fi
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Determined Version: ${VERSION}"
+          echo "Generated ARM64 ZIP package:"
+          ls -lh dist/service.faststrm-*-arm64.zip
+
+      - name: Create or Update GitHub Release
+        if: steps.sync.outputs.has_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.get_info.outputs.VERSION }}"
+          ZIP_SRC=$(ls dist/service.faststrm-*-arm64.zip | head -n 1)
+          
+          echo "Releasing version ${VERSION} with ARM64 zip asset to repository ${{ github.repository }}..."
+          
+          if gh release view "${VERSION}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${VERSION} already exists in ${{ github.repository }}, uploading asset..."
+            gh release upload "${VERSION}" "${ZIP_SRC}" --clobber --repo "${{ github.repository }}"
+          else
+            echo "Release ${VERSION} does not exist in ${{ github.repository }}, creating release..."
+            gh release create "${VERSION}" "${ZIP_SRC}" \
+              --repo "${{ github.repository }}" \
+              --title "FastStrm Kodi Addon ${VERSION} (CoreELEC ARM64)" \
+              --notes "FastStrm Kodi 后台服务插件自动构建发布版本。适合在 CoreELEC / Linux-arm64 上直接安装使用。"
+          fi

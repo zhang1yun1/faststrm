@@ -81,9 +81,11 @@ FastStrm 提供 3 种官方分发方式，任选其一：
 |:----:|----------|-----------------|
 | 🐳 **Docker**（最通用） | Linux / NAS / macOS / Windows，已有 Docker 环境 | `docker pull wabisabi926/faststrm:latest` |
 | 🐂 **飞牛 fNOS .fpk** | 飞牛 NAS（X86/ARM 机型），一键手动安装 | [GitHub Releases → 选择 `faststrm-{amd64\|arm64}-1.0.0.fpk`](https://github.com/wabisabi926/faststrm/releases) |
+| 📺 **Kodi 插件**（CoreELEC 推荐） | 电视盒子（CoreELEC Amlogic/ARM64 机型），零 Docker 依赖，开机自启 | [GitHub Releases → 下载 `service.faststrm-{version}-arm64.zip`](https://github.com/zhang1yun1/faststrm/releases) |
 | 🖥️ **源码 / 单二进制** | 想自己编译或跑在普通 Linux 主机 | `git clone -b go https://github.com/wabisabi926/faststrm && cd faststrm && go build ./cmd/server/` |
 
 > 📘 飞牛打包、定制、运行目录和排错详见 [docs/飞牛打包部署.md](docs/飞牛打包部署.md)
+> 📺 CoreELEC / Kodi 插件打包部署与使用详见 [docs/kodi_coreelec_guide.md](docs/kodi_coreelec_guide.md)
 
 ---
 
