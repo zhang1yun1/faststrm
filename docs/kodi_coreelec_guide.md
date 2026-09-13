@@ -79,3 +79,23 @@ chmod +x ./build_kodi_addon.sh
 - **定时同步**：定时检测官方上游 `wabisabi926/faststrm` 的 `go` 分支，当有更新时自动同步并触发构建。
 - **手动触发**：可以在 GitHub 仓库的 Actions 页面随时手动点击 **Run workflow** 触发打包。
 - **自动 Release**：构建完成后自动在 GitHub Releases 中生成版本并上传 `service.faststrm-*-arm64.zip`，可直接下载到电视盒子上使用。
+
+---
+
+## 📡 自动发布到 Kodi 插件库服务器 (Repository Server)
+
+如果拥有自己的 Web/插件库服务器（类似 LitePan 的 `kodi.jukuku.xyz`），只需在 GitHub 仓库的 **Settings -> Secrets and variables -> Actions** 中配置以下 Secrets：
+
+| Secret 变量名 | 说明 | 示例值 |
+|---|---|---|
+| `SERVER_HOST` | 插件库服务器 IP 或域名 | `kodi.example.com` |
+| `SSH_PRIVATE_KEY` | 用于部署的 SSH 私钥 | `-----BEGIN OPENSSH PRIVATE KEY...` |
+| `SERVER_USER` | SSH 登录用户名（默认为 `root`） | `root` |
+| `SERVER_PORT` | SSH 端口（默认为 `22`） | `22` |
+| `SERVER_PATH` | 插件库在服务器上的根目录 | `/var/www/kodi` |
+
+配置后，每次 GitHub Actions 构建成功都会自动：
+1. 生成标准插件库目录结构：`zips/service.faststrm/service.faststrm-<version>.zip`、`addon.xml`、`icon.png`；
+2. 通过 `rsync` 增量同步到远程服务器；
+3. 在远程服务器自动执行 `scripts/build_repo.py`，重新生成全局 `addons.xml` 与 `addons.xml.md5`；
+4. 用户在 CoreELEC / Kodi 中无需手动更新，Kodi 将自动收到新版本推送并无感升级！

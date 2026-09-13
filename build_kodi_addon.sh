@@ -469,8 +469,23 @@ cd "${BUILD_DIR}"
 rm -f "${ZIP_PATH}"
 zip -r -q "${ZIP_PATH}" "${ADDON_ID}"
 
+# 5. 生成本地 Kodi 插件库结构与索引 (可选供 Web 服务器直接托管)
+echo "[5/5] 生成 Kodi 插件库结构 (dist/zips/) 与索引..."
+REPO_STAGING="${DIST_DIR}/zips/${ADDON_ID}"
+mkdir -p "${REPO_STAGING}"
+cp -f "${ZIP_PATH}" "${REPO_STAGING}/${ADDON_ID}-${KODI_VERSION}.zip"
+cp -f "${ADDON_DIR}/addon.xml" "${REPO_STAGING}/addon.xml"
+if [ -f "${ADDON_DIR}/icon.png" ]; then
+    cp -f "${ADDON_DIR}/icon.png" "${REPO_STAGING}/icon.png"
+fi
+
+# 执行 build_repo.py 生成 addons.xml 与 md5
+if [ -f "${ROOT_DIR}/scripts/build_repo.py" ]; then
+    python3 "${ROOT_DIR}/scripts/build_repo.py" "${DIST_DIR}"
+fi
+
 echo "=================================================="
-echo " 构建成功！"
-echo " 产物文件: ${ZIP_PATH}"
-echo " 大小: $(ls -lh "${ZIP_PATH}" | awk '{print $5}')"
+echo " 全部构建完成！"
+echo " 单插件 ZIP: ${ZIP_PATH}"
+echo " 插件库目录: ${DIST_DIR}/zips/ (包含 addons.xml 及 md5)"
 echo "=================================================="
