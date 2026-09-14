@@ -172,8 +172,8 @@ func (m *Monitor) Start(ctx context.Context, account string) error {
 		return fmt.Errorf("账号 %s 的监控已在运行中", account)
 	}
 
-	// 创建子 context 用于停止 goroutine
-	accCtx, cancel := context.WithCancel(ctx)
+	// 创建独立 context 用于停止 goroutine（不继承请求 ctx，避免 HTTP 请求结束后 context 被取消）
+	accCtx, cancel := context.WithCancel(context.Background())
 
 	// 初始化 API 限流器
 	var rateLimiter *client115.APIRateLimiter
@@ -363,8 +363,8 @@ func (m *Monitor) VerifyAccount(ctx context.Context, account string) error {
 		return fmt.Errorf("生活事件未开启或 cookie 失效: %w", err)
 	}
 
-	// 测试拉取事件
-	events, err := lifeClient.PullEvents(ctx, account, 0, 0)
+	// 测试拉取事件：限制近1小时窗口，避免移除分页上限后拉取全部历史
+	events, err := lifeClient.PullEvents(ctx, account, time.Now().Unix()-3600, 0)
 	if err != nil {
 		m.markCookiePotentiallyInvalid(account, err)
 		return fmt.Errorf("拉取事件失败: %w", err)
@@ -477,8 +477,8 @@ func (m *Monitor) oncePoll(ctx context.Context, account string) error { //nolint
 		delCol.begin()
 	}
 	m.mu.Unlock()
-	maxEventID := int64(0)
-	maxEventTime := int64(0)
+	cursorID := int64(0)
+	cursorTime := int64(0)
 	// P1-4: 逆序处理（对齐参考项目 reversed(events_batch)）
 	// 115 API 返回的事件按时间倒序（最新在前），逆序后最早事件先处理
 	// 保证同一文件的多个事件按时间顺序执行（如先创建再重命名）
@@ -491,21 +491,21 @@ func (m *Monitor) oncePoll(ctx context.Context, account string) error { //nolint
 			break
 		}
 
+		// P1-5: 游标成对推进（对齐参考项目 once_pull 的 return_from_id/return_from_time）
+		// 逆序后按时间正序处理，最后处理的事件即本批次最新事件
+		// 游标始终取自同一事件的 (id, update_time)，避免独立取 max(id)/max(time) 拼出虚拟游标
+		eid, _ := strconv.ParseInt(event.ID, 10, 64)
+		etime := event.UpdateTime
+		if eid > 0 {
+			cursorID = eid
+			cursorTime = etime
+		}
+
 		counts.AddEntered()
 		if err := m.processEvent(ctx2, account, event, lifeClient); err != nil {
 			counts.AddError(err)
 			logger.S().Warnf("[Monitor] 处理事件失败 account=%s type=%d file=%s: %v",
 				account, event.Type, event.FileName, err)
-		}
-
-		// 跟踪本批次最大 id 和 update_time
-		eid, _ := strconv.ParseInt(event.ID, 10, 64)
-		etime := event.UpdateTime
-		if eid > maxEventID {
-			maxEventID = eid
-		}
-		if etime > maxEventTime {
-			maxEventTime = etime
 		}
 	}
 
@@ -515,10 +515,10 @@ func (m *Monitor) oncePoll(ctx context.Context, account string) error { //nolint
 	// 6. 更新账号状态和游标
 	m.mu.Lock()
 	if accMon, ok := m.accounts[account]; ok {
-		// 游标推进：有事件时更新到本批次最大 id 和 update_time
-		if maxEventID > 0 {
-			accMon.fromID = maxEventID
-			accMon.fromTime = maxEventTime
+		// 游标推进：有事件时使用本批次最新事件的 (id, update_time) 成对更新
+		if cursorID > 0 {
+			accMon.fromID = cursorID
+			accMon.fromTime = cursorTime
 		} else if accMon.fromTime == 0 && accMon.fromID == 0 {
 			// 首次无事件：用 pullEventsWithRetry 使用的 fromTime 回写游标
 			// pullEventsWithRetry 内部在 fromTime=0 时设为 now()-300，这里同步
@@ -544,8 +544,8 @@ func (m *Monitor) oncePoll(ctx context.Context, account string) error { //nolint
 
 	// P2-9: 持久化游标到 DB（对齐参考项目 db_helper.upsert_batch）
 	if m.lifeEventRepo != nil {
-		finalFromID := maxEventID
-		finalFromTime := maxEventTime
+		finalFromID := cursorID
+		finalFromTime := cursorTime
 		if finalFromID == 0 {
 			// 无事件时也要保存当前 fromTime（首次启动后）
 			if accMon, ok := m.accounts[account]; ok {
@@ -562,7 +562,7 @@ func (m *Monitor) oncePoll(ctx context.Context, account string) error { //nolint
 
 	if len(events) > 0 || counts.Entered > 0 {
 		logger.S().Infof("[Monitor] account=%s poll summary: pulled=%d %s from_id=%d from_time=%d",
-			account, len(events), counts.Summary(), maxEventID, maxEventTime)
+			account, len(events), counts.Summary(), cursorID, cursorTime)
 	}
 
 	// 事件处理错误摘要通知：批量事件中有失败时主动推送
