@@ -3,6 +3,12 @@ name: Sync Upstream & Release Kodi Addon
 on:
   schedule:
     - cron: '28 * * * *' # 每 1 小时检查一次上游更新
+  push:
+    branches:
+      - go
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch: # 支持在 GitHub Web 界面手动一键触发
 
 permissions:
@@ -21,6 +27,8 @@ jobs:
 
       - name: Sync with Upstream & Check Updates
         id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -30,18 +38,46 @@ jobs:
           NEW_COMMITS_COUNT=$(git rev-list --count HEAD..upstream/go)
           echo "New commits count from upstream: ${NEW_COMMITS_COUNT}"
 
-          # 判断上游代码变动（如果是定时触发且新 Commit 数量为 0 则跳过打包）
-          if [ "${NEW_COMMITS_COUNT}" -eq 0 ] && [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "No new commits from upstream. Skipping build and release."
-            echo "has_update=false" >> $GITHUB_OUTPUT
-          else
-            echo "New updates detected (${NEW_COMMITS_COUNT} commits, or manually triggered). Merging upstream code..."
+          # 若上游有新 commit 则先合并到当前分支
+          if [ "${NEW_COMMITS_COUNT}" -gt 0 ]; then
+            echo "Merging ${NEW_COMMITS_COUNT} upstream commits into go branch..."
             if ! git merge upstream/go --no-edit -X theirs --allow-unrelated-histories; then
-              echo "Merge encountered conflicts, aborting merge to preserve local files..."
+              echo "Merge encountered conflicts, aborting merge..."
               git merge --abort || true
             fi
             git push origin go || echo "No changes to push or push skipped."
+          fi
+
+          # 提取当前分支代码中的版本号
+          CURRENT_VER="v1.3.2"
+          if [ -f "cmd/server/main.go" ]; then
+            EXTRACTED_VER=$(grep -E '^[[:space:]]*version[[:space:]]*=' cmd/server/main.go | cut -d '"' -f 2)
+            if [ -n "${EXTRACTED_VER}" ]; then
+              CURRENT_VER="${EXTRACTED_VER}"
+            fi
+          fi
+          echo "Current codebase version: ${CURRENT_VER}"
+
+          # 检查 GitHub Releases 中该版本是否存在且包含 arm64 资产
+          RELEASE_EXISTS=false
+          if gh release view "${CURRENT_VER}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            RELEASE_EXISTS=true
+            echo "Release ${CURRENT_VER} already exists on GitHub."
+          else
+            echo "Release ${CURRENT_VER} does NOT exist yet on GitHub."
+          fi
+
+          # 判定是否需要构建发布：
+          # 1. 手动触发 (workflow_dispatch)
+          # 2. push 触发 (例如 Sync fork 或代码推送)
+          # 3. 上游有新 commit (NEW_COMMITS_COUNT > 0)
+          # 4. 当前代码版本尚未在 GitHub Releases 发布 (RELEASE_EXISTS == false)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ] || [ "${NEW_COMMITS_COUNT}" -gt 0 ] || [ "${RELEASE_EXISTS}" = "false" ]; then
+            echo "Build condition met! Proceeding to build and release."
             echo "has_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "No new upstream commits and Release ${CURRENT_VER} already exists. Skipping build."
+            echo "has_update=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Setup Go Environment
@@ -66,7 +102,7 @@ jobs:
         if: steps.sync.outputs.has_update == 'true'
         id: get_info
         run: |
-          VERSION="v1.3.1"
+          VERSION="v1.3.2"
           ZIP_SRC=$(ls dist/service.faststrm-*-arm64.zip | head -n 1)
           if [ -f "${ZIP_SRC}" ]; then
             KODI_VER=$(unzip -p "${ZIP_SRC}" "service.faststrm/addon.xml" | grep '<addon ' | sed -n 's/.*version="\([^"]*\)".*/\1/p')
@@ -120,7 +156,7 @@ jobs:
           echo "目标部署根目录: ${SERVER_PATH}"
           echo "=========================================="
 
-          # 1. 提取符合 Kodi 规范的纯点分版本号 (例如 1.3.1)
+          # 1. 提取符合 Kodi 规范的纯点分版本号 (例如 1.3.2)
           KODI_VER=$(echo "${VERSION}" | sed 's/^v//' | sed 's/-.*//')
           
           # 2. 组装插件库规范的 staging 目录
