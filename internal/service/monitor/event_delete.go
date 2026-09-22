@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -28,14 +29,24 @@ func (m *Monitor) handleDeleteEvent(
 	config := m.settingsFn()
 
 	// 对齐参考项目 remove() L1439-1443: DB无路径记录时不删除，"防止误删不处理"
+	// 若 DB 有记录则正常处理；若 DB 无记录，但本地对应 STRM 真实存在，仍允许删除（兼顾历史任务生成但未写库的文件）
 	if m.sqliteDB != nil && event.FileID != "" && event.FileID != "0" {
 		entry, err := db.GetFileOrFolderEntry(m.sqliteDB, account, event.FileID)
-		if err != nil || entry == nil || entry.Path == "" {
-			logger.S().Infof("[Monitor] delete: DB无路径记录，跳过防止误删 fid=%s name=%s（对齐参考项目 L1439-1443）",
-				event.FileID, event.FileName)
-			m.appendLog(ctx, account, "delete", false, cloudPath, mapping.localPath,
-				"跳过: DB无路径记录，防止误删")
-			return nil
+		if err == nil && entry != nil && entry.Path != "" {
+			// DB 有记录，继续正常删除流程
+		} else {
+			// DB 无记录：检查本地是否存在目标 STRM 文件，存在则允许删除，不存在才跳过
+			targetStrm := filepath.Join(mapping.localPath, getStrmFileName(event.FileName))
+			if event.FileCategory == 0 {
+				targetStrm = mapping.localPath
+			}
+			if _, statErr := os.Stat(targetStrm); statErr != nil {
+				logger.S().Infof("[Monitor] delete: DB无路径记录且本地无对应文件，跳过防止误删 fid=%s name=%s",
+					event.FileID, event.FileName)
+				m.appendLog(ctx, account, "delete", false, cloudPath, mapping.localPath,
+					"跳过: DB无路径记录且本地无对应文件")
+				return nil
+			}
 		}
 	}
 
@@ -53,6 +64,9 @@ func (m *Monitor) handleDeleteEvent(
 		m.appendLog(ctx, account, "delete", true, cloudPath, mapping.localPath, "文件夹已删除")
 		m.notifyDelete(ctx, account, cloudPath, "目录", mapping.localPath)
 		logger.S().Infof("[Monitor] 文件夹已删除: %s", mapping.localPath)
+		if m.sqliteDB != nil && event.FileID != "" {
+			_ = db.RemoveFilePathEntry(m.sqliteDB, account, event.FileID)
+		}
 		return nil
 	}
 
@@ -87,6 +101,77 @@ func (m *Monitor) handleDeleteEvent(
 		if err := m.embyRefresh.RefreshOnDelete(ctx, strmPath); err != nil {
 			logger.S().Warnf("[Monitor] Emby 刷库安排失败 path=%s: %v", strmPath, err)
 		}
+	}
+
+	// 清理 DB 中的记录
+	if m.sqliteDB != nil && event.FileID != "" {
+		_ = db.RemoveFilePathEntry(m.sqliteDB, account, event.FileID)
+	}
+
+	return nil
+}
+
+// handleDeleteFallback 当删除事件未命中路径映射（如 parent_id=0 且 DB 无记录导致退化为裸文件名）时，
+// 尝试通过本地文件名在各映射目录及挂载目录中检索并执行删除
+func (m *Monitor) handleDeleteFallback(
+	ctx context.Context,
+	account string,
+	event client115.LifeEventItem,
+	cloudPath string,
+) error {
+	config := m.settingsFn()
+	if !config.EventTypes.Remove {
+		return nil
+	}
+
+	localPath := m.findLocalStrmByFileName(account, event.FileName, event.FileCategory, config.PathMappings, config.MediaMountPath...)
+	if localPath == "" {
+		logger.S().Debugf("[Monitor] delete fallback: 本地未找到对应文件 fid=%s name=%s", event.FileID, event.FileName)
+		return nil
+	}
+
+	logger.S().Infof("[Monitor] delete fallback 命中本地文件: fid=%s name=%s localPath=%s", event.FileID, event.FileName, localPath)
+
+	// 文件夹事件
+	if event.FileCategory == 0 {
+		if err := strmutil.DeletePath(localPath); err != nil {
+			m.appendLog(ctx, account, "delete", false, cloudPath, localPath, fmt.Sprintf("删除目录失败: %v", err))
+			return fmt.Errorf("删除目录失败: %w", err)
+		}
+		if config.RemoveEmptyDirs {
+			removeEmptyParents(filepath.Dir(localPath), config.PathMappings)
+		}
+		m.appendLog(ctx, account, "delete", true, cloudPath, localPath, "文件夹已删除 (本地兜底)")
+		m.notifyDelete(ctx, account, cloudPath, "目录", localPath)
+		if m.sqliteDB != nil && event.FileID != "" {
+			_ = db.RemoveFilePathEntry(m.sqliteDB, account, event.FileID)
+		}
+		return nil
+	}
+
+	// 文件事件
+	if err := strmutil.DeleteStrmFile(localPath); err != nil {
+		m.appendLog(ctx, account, "delete", false, cloudPath, localPath, fmt.Sprintf("删除 STRM 失败: %v", err))
+		return fmt.Errorf("删除 STRM 失败: %w", err)
+	}
+	deletedRelated := deleteRelatedFiles(localPath)
+	if config.RemoveEmptyDirs {
+		removeEmptyParents(filepath.Dir(localPath), config.PathMappings)
+	}
+
+	m.appendLog(ctx, account, "delete", true, cloudPath, localPath,
+		fmt.Sprintf("STRM 已删除: %s (关联文件 %d 个) (本地兜底)", localPath, deletedRelated))
+	m.collectFileDelete(ctx, account, cloudPath, localPath)
+	logger.S().Infof("[Monitor] STRM 已删除 (本地兜底): %s (关联 %d)", localPath, deletedRelated)
+
+	if m.embyRefresh != nil {
+		if err := m.embyRefresh.RefreshOnDelete(ctx, localPath); err != nil {
+			logger.S().Warnf("[Monitor] Emby 刷库安排失败 path=%s: %v", localPath, err)
+		}
+	}
+
+	if m.sqliteDB != nil && event.FileID != "" {
+		_ = db.RemoveFilePathEntry(m.sqliteDB, account, event.FileID)
 	}
 
 	return nil

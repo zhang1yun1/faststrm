@@ -371,7 +371,12 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 				if relName != "" {
 					cloudPath = strings.TrimRight(originPath, "/") + "/" + relName
 				}
+				fileID := fmt.Sprintf("%v", e.FID)
+				if fileID == "" || fileID == "<nil>" || fileID == "0" {
+					fileID = fmt.Sprintf("%v", e.CID)
+				}
 				out = append(out, &fileItem{
+					FileID:    fileID,
 					CloudPath: cloudPath,
 					RelPath:   relName,
 					Name:      e.Name,

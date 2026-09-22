@@ -629,9 +629,13 @@ func (m *Monitor) preProcessEventWithSource( //nolint:cyclop // complexity: 34
 	// —— 永远 INFO 级：诊断第一！
 	logger.S().Infof("[Monitor] EVENT_DECIDE %s", decision.String())
 
-	// —— Write-Ahead DB：无论 ShouldAct 与否，只要 cloudPath+file_id 有就写（反查前置）
-	if entry, ok := buildWriteAheadEntry(event, cloudPath, pick); ok {
-		m.writeAheadFilePath(ctx, account, entry)
+	// —— Write-Ahead DB：仅当路径可信时才写入（防裸文件名污染）
+	// 单段路径（不含"/"）且未命中任何映射时，属于解析失败降级的裸文件名，禁止写入 DB 污染索引
+	isSingleSegUnmapped := !strings.Contains(cloudPath, "/") && mr.MappingType == MappingTypeNone
+	if !isSingleSegUnmapped {
+		if entry, ok := buildWriteAheadEntry(event, cloudPath, pick); ok {
+			m.writeAheadFilePath(ctx, account, entry)
+		}
 	}
 
 	// —— new_folder type=17 专用分支：命中 MEDIA → 写 folders 表 + 记一条 success=true 的 lifeLog，然后"消化掉"

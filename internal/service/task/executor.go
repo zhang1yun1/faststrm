@@ -417,6 +417,7 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 				continue
 			}
 			entries = append(entries, db.FilePathEntry{
+				FileID:     f.FileID,
 				Path:       f.CloudPath,
 				FileName:   f.Name,
 				PickCode:   f.PickCode,
@@ -801,6 +802,7 @@ const (
 )
 
 type fileItem struct {
+	FileID    string // 115 文件 ID
 	CloudPath string // 绝对云端路径：originPath + "/" + rel
 	RelPath   string // 相对路径（不含 originPath 前缀）
 	Name      string

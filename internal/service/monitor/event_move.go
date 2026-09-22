@@ -241,65 +241,92 @@ func (m *Monitor) findLocalStrmByFileName(account, fileName string, fileCategory
 	if fileName == "" {
 		return ""
 	}
-	// 先在映射目录中搜索
-	for _, mp := range mappings {
-		if mp.LocalPath == "" {
-			continue
-		}
-		// 文件夹：在 LocalPath 下查找同名目录
-		if fileCategory == 0 {
-			candidate := filepath.Join(mp.LocalPath, fileName)
-			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
-				return candidate
-			}
-		} else {
-			// 文件：在 LocalPath 下查找同名 .strm 文件
-			strmName := getStrmFileName(fileName)
-			entries, err := os.ReadDir(mp.LocalPath)
-			if err != nil {
-				continue
-			}
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				strmPath := filepath.Join(mp.LocalPath, entry.Name(), strmName)
-				if _, err := os.Stat(strmPath); err == nil {
-					return strmPath
-				}
-			}
-		}
-	}
 
-	// 再在扩展目录中搜索（如 MediaMountPath）
-	for _, dir := range extendedDirs {
+	searchDir := func(dir string) string {
 		if dir == "" {
-			continue
+			return ""
 		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
-			continue
+			return ""
 		}
+
 		if fileCategory == 0 {
 			candidate := filepath.Join(dir, fileName)
 			if info, err := os.Stat(candidate); err == nil && info.IsDir() {
 				return candidate
 			}
-		} else {
-			strmName := getStrmFileName(fileName)
-			entries, err := os.ReadDir(dir)
+			// 递归查找子目录
+			var foundDir string
+			_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if p == dir {
+					return nil
+				}
+				rel, relErr := filepath.Rel(dir, p)
+				if relErr != nil || strings.Count(rel, string(filepath.Separator)) > 3 {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if d.IsDir() && strings.EqualFold(d.Name(), fileName) {
+					foundDir = p
+					return filepath.SkipAll
+				}
+				return nil
+			})
+			return foundDir
+		}
+
+		// 文件：先查当前根目录
+		strmName := getStrmFileName(fileName)
+		rootCandidate := filepath.Join(dir, strmName)
+		if _, err := os.Stat(rootCandidate); err == nil {
+			return rootCandidate
+		}
+
+		// 递归查找子目录下的 .strm 文件（深度限制 4 层）
+		var foundFile string
+		_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 			if err != nil {
-				continue
+				return nil
 			}
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					continue
-				}
-				strmPath := filepath.Join(dir, entry.Name(), strmName)
-				if _, err := os.Stat(strmPath); err == nil {
-					return strmPath
-				}
+			if p == dir {
+				return nil
 			}
+			rel, relErr := filepath.Rel(dir, p)
+			if relErr != nil || strings.Count(rel, string(filepath.Separator)) > 3 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !d.IsDir() && strings.EqualFold(d.Name(), strmName) {
+				foundFile = p
+				return filepath.SkipAll
+			}
+			return nil
+		})
+		return foundFile
+	}
+
+	// 先在映射目录中搜索
+	for _, mp := range mappings {
+		if mp.LocalPath == "" {
+			continue
+		}
+		if res := searchDir(mp.LocalPath); res != "" {
+			return res
+		}
+	}
+
+	// 再在扩展目录中搜索（如 MediaMountPath）
+	for _, dir := range extendedDirs {
+		if res := searchDir(dir); res != "" {
+			return res
 		}
 	}
 	return ""

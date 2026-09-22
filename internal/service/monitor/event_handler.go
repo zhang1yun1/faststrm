@@ -189,6 +189,17 @@ func (m *Monitor) processEvent(ctx context.Context, account string, event client
 			}
 			return err
 		}
+		// 删除事件兜底：若因 no_path_mapping / cloud_path_unresolved 跳过，尝试按文件名在本地兜底删除
+		if client115.DeleteEventTypes[eventType] && config.EventTypes.Remove {
+			start := time.Now()
+			err := m.handleDeleteFallback(ctx, account, event, cloudPath)
+			m.recordMonitorHistory(account, db.StrmHistoryKindDelete, err, time.Since(start))
+			if err == nil {
+				pollCountsAddEffective(ctx)
+				m.markDedupProcessed(event)
+			}
+			return err
+		}
 		pollCountsAddSkipped(ctx, decision.SkipReason)
 		m.markDedupProcessed(event)
 		return nil
