@@ -165,6 +165,9 @@ func (m *Monitor) processEvent(ctx context.Context, account string, event client
 	cloudPath := decision.CloudPath
 	if cloudPath == "" {
 		// EVENT_DECIDE 已记录 cloud_path_unresolved；此处把错误再返回 pollOnce，pollOnce 会累计 Errors 并推进 LastErr UI 可见
+		// P1-1：同时写入用户可见事件日志，避免"没日志、没反应"的观感
+		m.appendLog(ctx, account, string(decision.EventKind), false, "", "",
+			fmt.Sprintf("跳过: cloud_path_unresolved (file=%s fid=%s)", event.FileName, event.FileID))
 		pollCountsAddSkipped(ctx, "cloud_path_unresolved")
 		m.markDedupProcessed(event)
 		return fmt.Errorf("event file_path 为空且路径解析失败，无法处理")
@@ -192,13 +195,17 @@ func (m *Monitor) processEvent(ctx context.Context, account string, event client
 		// 删除事件兜底：若因 no_path_mapping / cloud_path_unresolved 跳过，尝试按文件名在本地兜底删除
 		if client115.DeleteEventTypes[eventType] && config.EventTypes.Remove {
 			start := time.Now()
-			err := m.handleDeleteFallback(ctx, account, event, cloudPath)
-			m.recordMonitorHistory(account, db.StrmHistoryKindDelete, err, time.Since(start))
-			if err == nil {
+			if err := m.handleDeleteFallback(ctx, account, event, cloudPath); err == nil {
+				m.recordMonitorHistory(account, db.StrmHistoryKindDelete, nil, time.Since(start))
 				pollCountsAddEffective(ctx)
 				m.markDedupProcessed(event)
+				return nil
 			}
-			return err
+		}
+		// P1-1：关键跳过原因写入用户可见事件日志（只记录疑似配置问题的原因，避免常规过滤刷屏）
+		if shouldLogSkipReason(decision.SkipReason) {
+			m.appendLog(ctx, account, string(decision.EventKind), false, cloudPath, decision.MatchedLocalBase,
+				fmt.Sprintf("跳过: %s (file=%s)", decision.SkipReason, event.FileName))
 		}
 		pollCountsAddSkipped(ctx, decision.SkipReason)
 		m.markDedupProcessed(event)
@@ -207,7 +214,12 @@ func (m *Monitor) processEvent(ctx context.Context, account string, event client
 
 	// —— skipReason 空但 MappingType 不是 MEDIA：Phase2+ 才有转移/未识别专用流，此处按 skipped 处理
 	if decision.MappingType != MappingTypeMedia {
-		pollCountsAddSkipped(ctx, "mapping_type_"+string(decision.MappingType)+"_phase2_not_handled")
+		reason := "mapping_type_" + string(decision.MappingType) + "_phase2_not_handled"
+		if shouldLogSkipReason(reason) {
+			m.appendLog(ctx, account, string(decision.EventKind), false, cloudPath, decision.MatchedLocalBase,
+				fmt.Sprintf("跳过: %s (file=%s)", reason, event.FileName))
+		}
+		pollCountsAddSkipped(ctx, reason)
 		m.markDedupProcessed(event)
 		return nil
 	}
@@ -300,6 +312,23 @@ func (m *Monitor) markDedupProcessed(event client115.LifeEventItem) {
 		return
 	}
 	m.dedup.MarkProcessed(event.FileID, strconv.Itoa(event.Type), event.ParentID)
+}
+
+// shouldLogSkipReason P1-1：判断 skip 原因是否需要写入用户可见日志（前端"生活事件日志"）。
+// 只记录"疑似配置问题"的关键原因，避免常规过滤（非媒体扩展名/过小/黑名单）在批量上传时刷屏。
+func shouldLogSkipReason(reason string) bool {
+	switch {
+	case strings.HasPrefix(reason, "event_type_disabled_"):
+		return true
+	case reason == "no_path_mapping",
+		reason == "cloud_path_unresolved",
+		reason == "invalid_pickcode",
+		reason == "mapping_unrecognized",
+		reason == "mapping_transfer_Phase2+_not_yet_handled",
+		reason == "new_folder_not_in_media_mapping":
+		return true
+	}
+	return false
 }
 
 // resolveCloudPathFromDB 按 fileID 反查 DB 缓存路径（方案 B）。

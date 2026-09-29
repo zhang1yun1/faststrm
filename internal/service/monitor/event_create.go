@@ -195,8 +195,29 @@ func (m *Monitor) handleCreateEvent(
 	lifeClient *client115.LifeClient,
 	notify bool,
 ) error {
+	// BDMV 原盘：位于 BDMV/STREAM 内的视频流不生成 STRM
+	// （一个蓝光原盘会变成上百个 m2ts 碎片，对齐参考项目 directory_upload_skip_bdmv_stream）
+	if model.IsBdmvStreamPath(cloudPath) {
+		logger.S().Infof("[Monitor] 跳过 BDMV/STREAM 原盘视频流: %s", cloudPath)
+		m.appendLog(ctx, account, "create", false, cloudPath, "",
+			"跳过: BDMV/STREAM 原盘视频流")
+		pollCountsAddSkipped(ctx, "bdmv_stream_skipped")
+		return nil
+	}
+
 	// 文件夹事件：先 mkdir，写根文件夹到 DB，然后递归遍历内部媒体文件生成 STRM
-	if event.FileCategory == 0 {
+	// P1-2 防线：115 偶发把单文件误标为目录（FileCategory==0），此时按文件夹处理会 mkdir 出
+	// 同名空目录、且 FsFiles(文件ID) 返回空 → 一个 STRM 都生成不了且无日志报错。
+	// 仅当"目录名带媒体扩展名"（正常目录几乎不会）时才额外校验一次，避免多余 API 调用。
+	isFolder := event.FileCategory == 0
+	if isFolder && lifeClient != nil && isMediaFile(event.FileName, model.DefaultStrmExtensions) {
+		if empty, ferr := folderIsEmpty(ctx, lifeClient, event.FileID); ferr == nil && empty {
+			logger.S().Warnf("[Monitor] create: 目录事件疑似单文件误标 name=%s fid=%s → 回退按单文件处理",
+				event.FileName, event.FileID)
+			isFolder = false
+		}
+	}
+	if isFolder {
 		if err := os.MkdirAll(mapping.localPath, 0o755); err != nil {
 			m.appendLog(ctx, account, "create", false, cloudPath, mapping.localPath,
 				fmt.Sprintf("mkdir 失败: %v", err))
@@ -246,9 +267,10 @@ func (m *Monitor) handleCreateEvent(
 		FileID:    event.FileID,
 		ParentID:  event.ParentID,
 	}
-	// 关键：mapping.localPath 已包含相对路径（如 dist\Strm\小王子），直接作为 STRM 目录
-	// 不能用 filepath.Dir()，否则会丢失最后一级目录
-	localParentDir := mapping.localPath
+	// 关键：单文件事件下 mapping.localPath 末段是文件名（前缀匹配拼入），
+	// 需回收一级到父目录（对齐参考项目取 file_path.parent），否则会多拼一层同名目录。
+	// 精确匹配(映射根)时 singleFileParentDir 返回原值。
+	localParentDir := singleFileParentDir(mapping)
 	strmPath, err := m.createStrmForSingleFile(ctx, account, in, localParentDir, "文件")
 	if err != nil {
 		m.appendLog(ctx, account, "create", false, cloudPath, mapping.localPath, err.Error())
@@ -265,6 +287,22 @@ func (m *Monitor) handleCreateEvent(
 		m.notifyCreate(ctx, account, cloudPath, "文件", strmPath, event.FileSize)
 	}
 	return nil
+}
+
+// folderIsEmpty P1-2：判断云端目录是否为空（用于识别 115 把单文件误标为目录的情况）。
+// 只取第一页 1 条，判断开销最小。
+func folderIsEmpty(ctx context.Context, lifeClient *client115.LifeClient, folderID string) (bool, error) {
+	if folderID == "" || folderID == "0" {
+		return false, fmt.Errorf("invalid folderID %q", folderID)
+	}
+	resp, err := lifeClient.FsFiles(ctx, folderID, 1, 0)
+	if err != nil {
+		return false, err
+	}
+	if resp == nil {
+		return true, nil
+	}
+	return len(resp.Data) == 0, nil
 }
 
 // handleCreateFolderRecursive DFS 遍历文件夹，对每个媒体文件创建 STRM
@@ -342,6 +380,12 @@ func (m *Monitor) handleCreateFolderRecursive(
 				return totalCreated, nil
 			}
 			entryCloudPath := folderCloudPath + "/" + entry.Name
+			// BDMV 原盘：跳过 BDMV/STREAM 层级（含其目录本身，不再向下递归），
+			// 避免一个蓝光原盘被拆成上百个 m2ts STRM。ISO 原盘不受影响。
+			if model.IsBdmvStreamPath(entryCloudPath) {
+				logger.S().Infof("[Monitor] 跳过 BDMV/STREAM 原盘视频流: %s", entryCloudPath)
+				continue
+			}
 			if entry.IsDir {
 				// P1-5: 子目录写入 folders 表（对齐参考项目 process_life_dir_item upsert_batch）
 				if m.sqliteDB != nil {

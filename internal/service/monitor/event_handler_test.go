@@ -3,6 +3,8 @@ package monitor
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/wabisabi926/faststrm/internal/model"
 	"github.com/wabisabi926/faststrm/internal/service/client115"
+	"github.com/wabisabi926/faststrm/internal/service/db"
 )
 
 // newTestMonitor 创建仅用于 handleStallError 测试的最小 Monitor
@@ -428,5 +431,425 @@ func TestFlushDeleteNotifications_InactiveFallback(t *testing.T) {
 	m.collectFileDelete(ctx, "acc1", "/cloud/a.mkv", "/strm/a.strm")
 	if got := len(fn.Messages()); got != 0 {
 		t.Errorf("非批次单文件不应直接 Notify（走合并器），实际 %d", got)
+	}
+}
+
+// ======================================================================
+// P0-4 删除事件：真实文件系统验证
+// ======================================================================
+
+// TestHandleDeleteEvent_DeletesExistingStrm
+// 本地存在 STRM 时必须真正删除，且返回 nil。
+func TestHandleDeleteEvent_DeletesExistingStrm(t *testing.T) {
+	dir := t.TempDir()
+	// relativePath=="" → singleFileParentDir 返回 localPath（映射根即目录），
+	// 因此 strmPath = <dir>/Movie.2024.strm
+	mapping := &pathMapping{cloudPath: "电影", localPath: dir, relativePath: ""}
+	strmPath := filepath.Join(dir, "Movie.2024.strm")
+	if err := os.WriteFile(strmPath, []byte("http://example/stream"), 0o644); err != nil {
+		t.Fatalf("write strm: %v", err)
+	}
+
+	m := &Monitor{settingsFn: func() model.LifeMonitorSettings {
+		return model.LifeMonitorSettings{RemoveEmptyDirs: false}
+	}}
+	event := client115.LifeEventItem{FileID: "1", FileName: "Movie.2024.mkv", FileCategory: 1}
+
+	if err := m.handleDeleteEvent(context.Background(), "acc1", event, mapping, "电影/Movie.2024.mkv", nil); err != nil {
+		t.Fatalf("handleDeleteEvent: %v", err)
+	}
+	if _, err := os.Stat(strmPath); !os.IsNotExist(err) {
+		t.Fatalf("STRM 应已被真正删除, stat err=%v", err)
+	}
+}
+
+// TestHandleDeleteEvent_NotFound_NoFalseSuccess
+// 本地不存在对应 STRM 时：必须返回 nil（跳过而非报错），
+// 且 life_event_logs 必须记录一条 success=false —— 不得谎报成功（问题②根因）。
+func TestHandleDeleteEvent_NotFound_NoFalseSuccess(t *testing.T) {
+	dir := t.TempDir()
+	sqldb, err := db.OpenNew(dir)
+	if err != nil {
+		t.Fatalf("Open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	logRepo, err := db.NewLifeEventLogRepo(sqldb)
+	if err != nil {
+		t.Fatalf("NewLifeEventLogRepo: %v", err)
+	}
+
+	m := &Monitor{
+		settingsFn:       func() model.LifeMonitorSettings { return model.LifeMonitorSettings{RemoveEmptyDirs: false} },
+		sqliteDB:         sqldb,
+		lifeEventLogRepo: logRepo,
+	}
+	// 目录本身不存在 → 主路径 Stat 失败且无兜底命中
+	mapping := &pathMapping{cloudPath: "电影", localPath: filepath.Join(dir, "missing"), relativePath: ""}
+	event := client115.LifeEventItem{FileID: "9", FileName: "Gone.2020.mkv", FileCategory: 1}
+
+	ctx := context.Background()
+	if err := m.handleDeleteEvent(ctx, "acc1", event, mapping, "电影/Gone.2020.mkv", nil); err != nil {
+		t.Fatalf("本地不存在时应跳过并返回 nil, got %v", err)
+	}
+	logs, err := logRepo.Query(ctx, db.LifeEventLogQuery{Account: "acc1", Limit: 10})
+	if err != nil {
+		t.Fatalf("Query life logs: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("应记录 1 条删除失败日志, got %d (%+v)", len(logs), logs)
+	}
+	if logs[0].Success {
+		t.Fatalf("不得谎报删除成功: %+v", logs[0])
+	}
+}
+
+// TestHandleDeleteEvent_FallbackByFileName
+// P0-4 兜底分支：事件携带的主路径不存在（mapping.localPath 已失效/云路径已变化）时，
+// 必须用文件名在 config.PathMappings 各本地根的子目录中兜底命中并真正删除。
+// 断言日志 LocalPath == 兜底命中路径，以证明走的确实是兜底分支而非主路径。
+func TestHandleDeleteEvent_FallbackByFileName(t *testing.T) {
+	dir := t.TempDir()
+	// 兜底搜索根（对应 config.PathMappings 的 LocalPath），STRM 位于其子目录内
+	searchRoot := filepath.Join(dir, "StrmRoot")
+	actualDir := filepath.Join(searchRoot, "Movie.2024")
+	if err := os.MkdirAll(actualDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	strmPath := filepath.Join(actualDir, "Movie.2024.strm")
+	if err := os.WriteFile(strmPath, []byte("http://example/stream"), 0o644); err != nil {
+		t.Fatalf("write strm: %v", err)
+	}
+
+	sqldb, err := db.OpenNew(dir)
+	if err != nil {
+		t.Fatalf("Open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	logRepo, err := db.NewLifeEventLogRepo(sqldb)
+	if err != nil {
+		t.Fatalf("NewLifeEventLogRepo: %v", err)
+	}
+
+	cfg := model.LifeMonitorSettings{
+		RemoveEmptyDirs: false,
+		PathMappings: []model.MonitorPathMapping{
+			{Account: "acc1", CloudPath: "电影", LocalPath: searchRoot},
+		},
+	}
+	m := &Monitor{
+		settingsFn:       func() model.LifeMonitorSettings { return cfg },
+		sqliteDB:         sqldb,
+		lifeEventLogRepo: logRepo,
+	}
+	// 事件携带的 mapping.localPath 已失效 → 主路径 <stale>/Movie.2024.strm 不存在 → 触发兜底
+	staleRoot := filepath.Join(dir, "stale")
+	mapping := &pathMapping{cloudPath: "电影", localPath: staleRoot, relativePath: ""}
+	event := client115.LifeEventItem{FileID: "7", FileName: "Movie.2024.mkv", FileCategory: 1}
+
+	ctx := context.Background()
+	if err := m.handleDeleteEvent(ctx, "acc1", event, mapping, "电影/Movie.2024.mkv", nil); err != nil {
+		t.Fatalf("handleDeleteEvent: %v", err)
+	}
+	if _, err := os.Stat(strmPath); !os.IsNotExist(err) {
+		t.Fatalf("兜底命中的 STRM 应被真正删除, stat err=%v", err)
+	}
+	logs, err := logRepo.Query(ctx, db.LifeEventLogQuery{Account: "acc1", Limit: 10})
+	if err != nil {
+		t.Fatalf("Query life logs: %v", err)
+	}
+	if len(logs) != 1 || !logs[0].Success {
+		t.Fatalf("兜底删除成功应记录 1 条 success=true 日志, got %+v", logs)
+	}
+	if logs[0].LocalPath != strmPath {
+		t.Fatalf("日志 LocalPath 应指向兜底命中路径 %q, got %q", strmPath, logs[0].LocalPath)
+	}
+}
+
+// ======================================================================
+// P1-1 跳过原因是否提升为可见日志
+// ======================================================================
+
+// TestShouldLogSkipReason 只有"疑似配置问题"的关键原因才写可见日志，
+// 常规过滤（扩展名/大小/黑名单）不得刷屏。
+func TestShouldLogSkipReason(t *testing.T) {
+	mustLog := []string{
+		"event_type_disabled_create",
+		"event_type_disabled_remove",
+		"no_path_mapping",
+		"cloud_path_unresolved",
+		"invalid_pickcode",
+		"mapping_unrecognized",
+		"mapping_transfer_Phase2+_not_yet_handled",
+		"new_folder_not_in_media_mapping",
+	}
+	for _, r := range mustLog {
+		if !shouldLogSkipReason(r) {
+			t.Errorf("reason %q 应写可见日志", r)
+		}
+	}
+	mustNotLog := []string{
+		"non_media_extension",
+		"file_too_small",
+		"blacklist",
+		"",
+		"delete_strm_not_found",
+	}
+	for _, r := range mustNotLog {
+		if shouldLogSkipReason(r) {
+			t.Errorf("reason %q 属常规过滤，不应刷可见日志", r)
+		}
+	}
+}
+
+// ======================================================================
+// P1-2 单文件被 115 误标为目录（FileCategory==0）的防线
+// ======================================================================
+
+// fixedHTTPResponseRT 拦截所有请求返回固定 body（FsFiles 走 Client.HTTP，可注入）
+type fixedHTTPResponseRT struct {
+	body string
+}
+
+func (r *fixedHTTPResponseRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(r.body)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+// newLifeClientWithFsBody 构造 FsFiles 返回固定 JSON 的 LifeClient（注入假 HTTP 传输）
+func newLifeClientWithFsBody(fsBody string) *client115.LifeClient {
+	lc := client115.NewLifeClient("test-cookie")
+	lc.FsClient().HTTP = &http.Client{Transport: &fixedHTTPResponseRT{body: fsBody}}
+	return lc
+}
+
+// TestFolderIsEmpty_EmptyAndNonEmpty 校验 P1-2 的判空谓词
+func TestFolderIsEmpty_EmptyAndNonEmpty(t *testing.T) {
+	ctx := context.Background()
+
+	empty, err := folderIsEmpty(ctx, newLifeClientWithFsBody(`{"state":true,"data":[]}`), "40001")
+	if err != nil {
+		t.Fatalf("空目录判定出错: %v", err)
+	}
+	if !empty {
+		t.Fatalf("data=[] 应判定为空目录")
+	}
+
+	nonEmpty, err := folderIsEmpty(ctx, newLifeClientWithFsBody(`{"state":true,"data":[{"fid":"123","n":"inner.mkv"}]}`), "40002")
+	if err != nil {
+		t.Fatalf("非空目录判定出错: %v", err)
+	}
+	if nonEmpty {
+		t.Fatalf("data 非空不应判定为空目录")
+	}
+
+	// 非法 folderID 直接报错（不能误判为空，否则会把正常文件夹当单文件处理）
+	if _, err := folderIsEmpty(ctx, newLifeClientWithFsBody(`{"state":true,"data":[]}`), "0"); err == nil {
+		t.Fatalf("folderID=0 应返回错误")
+	}
+}
+
+// TestHandleCreateEvent_MislabeledFolder_FallsBackToSingleFile
+// 核心回归：FileCategory==0（被 115 误标为目录）+ 文件名带媒体扩展名 + 云端目录为空
+// 时必须回退按单文件处理，生成 1 个 STRM；否则会走文件夹分支（FsFiles 为空）→ 0 个 STRM（问题①）。
+func TestHandleCreateEvent_MislabeledFolder_FallsBackToSingleFile(t *testing.T) {
+	dir := t.TempDir()
+	localRoot := filepath.Join(dir, "Videos")
+	if err := os.MkdirAll(localRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// 云端 FsFiles(fileID) 返回空 → 触发 P1-2 回退
+	lifeClient := newLifeClientWithFsBody(`{"state":true,"data":[]}`)
+
+	m := &Monitor{settingsFn: func() model.LifeMonitorSettings {
+		return model.LifeMonitorSettings{OverwriteMode: "always"}
+	}}
+	mapping := &pathMapping{cloudPath: "电影", localPath: localRoot, relativePath: ""}
+
+	event := client115.LifeEventItem{
+		FileID:       "555",
+		FileName:     "Movie.2024.mkv",
+		ParentID:     "1",
+		FileCategory: 0,                   // 被 115 误标为目录
+		PickCode:     "abcdefghij1234567", // 17 位合法 pickcode
+		FileSize:     1024 * 1024 * 100,
+	}
+	if err := m.handleCreateEvent(context.Background(), "acc1", event, mapping, "电影/Movie.2024.mkv", lifeClient, false); err != nil {
+		t.Fatalf("handleCreateEvent: %v", err)
+	}
+
+	// 回退成功：按单文件生成 STRM（若仍走文件夹分支 → 递归 0 个 → 不会出现该文件）
+	strmPath := filepath.Join(localRoot, "Movie.2024.strm")
+	if _, err := os.Stat(strmPath); err != nil {
+		t.Fatalf("P1-2 回退失败：应按单文件生成 %s, stat err=%v", strmPath, err)
+	}
+}
+
+// ======================================================================
+// BDMV 原盘过滤：BDMV/STREAM 内的 m2ts 不生成 STRM（一个原盘会变成上百个碎片）
+// ======================================================================
+
+// cidRoutingRT 按 URL 的 cid 参数返回不同 FsFiles 响应，并记录被请求过的 cid
+type cidRoutingRT struct {
+	fixtures map[string]string // cid → JSON body
+	mu       sync.Mutex
+	seen     []string
+}
+
+func (r *cidRoutingRT) RoundTrip(req *http.Request) (*http.Response, error) {
+	cid := req.URL.Query().Get("cid")
+	r.mu.Lock()
+	r.seen = append(r.seen, cid)
+	r.mu.Unlock()
+	body := r.fixtures[cid]
+	if body == "" {
+		body = `{"state":true,"data":[]}`
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func (r *cidRoutingRT) requested(cid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.seen {
+		if c == cid {
+			return true
+		}
+	}
+	return false
+}
+
+// walkStrmFiles 收集目录下所有 .strm 文件
+func walkStrmFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var out []string
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() && strings.HasSuffix(p, ".strm") {
+			out = append(out, p)
+		}
+		return nil
+	})
+	return out
+}
+
+// TestHandleCreateEvent_BdmvStreamFile_Skipped 单文件事件位于 BDMV/STREAM 内 → 不生成 STRM，
+// 且必须留下可见的跳过日志（避免"没反应没日志"）。
+func TestHandleCreateEvent_BdmvStreamFile_Skipped(t *testing.T) {
+	dir := t.TempDir()
+	localRoot := filepath.Join(dir, "Videos")
+	if err := os.MkdirAll(localRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	sqldb, err := db.OpenNew(dir)
+	if err != nil {
+		t.Fatalf("Open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	logRepo, err := db.NewLifeEventLogRepo(sqldb)
+	if err != nil {
+		t.Fatalf("NewLifeEventLogRepo: %v", err)
+	}
+
+	m := &Monitor{
+		settingsFn: func() model.LifeMonitorSettings {
+			return model.LifeMonitorSettings{OverwriteMode: "always"}
+		},
+		sqliteDB:         sqldb,
+		lifeEventLogRepo: logRepo,
+	}
+	mapping := &pathMapping{
+		cloudPath:    "电影/沙丘/BDMV/STREAM",
+		localPath:    filepath.Join(localRoot, "BDMV", "STREAM"),
+		relativePath: "BDMV/STREAM",
+	}
+	cloudPath := "电影/沙丘/BDMV/STREAM/00000.m2ts"
+	event := client115.LifeEventItem{
+		FileID:       "999",
+		FileName:     "00000.m2ts",
+		ParentID:     "400",
+		FileCategory: 1,
+		PickCode:     "abcdefghij1234567",
+		FileSize:     30 * 1024 * 1024 * 1024,
+	}
+
+	ctx := context.Background()
+	if err := m.handleCreateEvent(ctx, "acc1", event, mapping, cloudPath, nil, false); err != nil {
+		t.Fatalf("handleCreateEvent: %v", err)
+	}
+	if got := walkStrmFiles(t, localRoot); len(got) != 0 {
+		t.Fatalf("BDMV/STREAM 不应生成任何 STRM, got %v", got)
+	}
+
+	logs, err := logRepo.Query(ctx, db.LifeEventLogQuery{Account: "acc1", Limit: 10})
+	if err != nil {
+		t.Fatalf("Query life logs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].Success {
+		t.Fatalf("应记录 1 条 success=false 的跳过日志, got %+v", logs)
+	}
+	if !strings.Contains(logs[0].Message, "BDMV") {
+		t.Fatalf("日志应说明 BDMV 跳过原因, got %q", logs[0].Message)
+	}
+}
+
+// TestHandleCreateEvent_BdmvFolder_SkipsStreamSubtree 文件夹事件内含 BDMV/STREAM：
+// 普通媒体照常生成 STRM；STREAM 子树不得被遍历（其 cid 不应被请求），m2ts 不生成 STRM。
+func TestHandleCreateEvent_BdmvFolder_SkipsStreamSubtree(t *testing.T) {
+	dir := t.TempDir()
+	localRoot := filepath.Join(dir, "Videos")
+	if err := os.MkdirAll(localRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	rt := &cidRoutingRT{fixtures: map[string]string{
+		// 根目录：BDMV 子目录 + 一个普通媒体文件
+		"200": `{"state":true,"data":[` +
+			`{"n":"BDMV","cid":300,"fc":2},` +
+			`{"n":"movie.mkv","fid":11,"pc":"abcdefghij1234567","s":100000,"cid":200}]}`,
+		// BDMV 目录：STREAM 子目录 + 一个非媒体文件
+		"300": `{"state":true,"data":[` +
+			`{"n":"STREAM","cid":400,"fc":2},` +
+			`{"n":"index.bdmv","fid":22,"s":10,"cid":300}]}`,
+		// STREAM 目录：内部全是原盘视频流（不应被请求）
+		"400": `{"state":true,"data":[` +
+			`{"n":"00000.m2ts","fid":33,"pc":"abcdefghij1234567","s":30000000000,"cid":400}]}`,
+	}}
+	lifeClient := client115.NewLifeClient("test-cookie")
+	lifeClient.FsClient().HTTP = &http.Client{Transport: rt}
+
+	m := &Monitor{settingsFn: func() model.LifeMonitorSettings {
+		return model.LifeMonitorSettings{OverwriteMode: "always"}
+	}}
+	mapping := &pathMapping{cloudPath: "电影/沙丘", localPath: localRoot, relativePath: ""}
+	event := client115.LifeEventItem{
+		FileID: "200", FileName: "沙丘", ParentID: "1", FileCategory: 0,
+	}
+
+	ctx := context.Background()
+	if err := m.handleCreateEvent(ctx, "acc1", event, mapping, "电影/沙丘", lifeClient, false); err != nil {
+		t.Fatalf("handleCreateEvent: %v", err)
+	}
+
+	// 普通媒体照常生成
+	if _, err := os.Stat(filepath.Join(localRoot, "movie.strm")); err != nil {
+		t.Fatalf("普通媒体应生成 movie.strm, stat err=%v", err)
+	}
+	// STREAM 子树不得被遍历
+	if rt.requested("400") {
+		t.Fatalf("BDMV/STREAM 子树不应被遍历（cid=400 被请求了），请求记录=%v", rt.seen)
+	}
+	// 除 movie.strm 外不得有其它 STRM
+	if got := walkStrmFiles(t, localRoot); len(got) != 1 || !strings.HasSuffix(got[0], "movie.strm") {
+		t.Fatalf("应只生成 movie.strm, got %v", got)
 	}
 }

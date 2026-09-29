@@ -261,6 +261,7 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 
 	cidSeen := make(map[int64]struct{})
 	dirCount, fileCount, matchCount := 0, 0, 0
+	bdmvSkipped := 0
 	logger.S().Infof("[listAllFilesRecursive] start cid=%d originPath=%s", rootCID, originPath)
 
 	// ---- 扫描进度心跳：每 3 秒广播一次（让 UI 知道后台还活着） ----
@@ -304,6 +305,9 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 
 	defer func() {
 		logger.S().Infof("[listAllFilesRecursive] done dirs=%d files=%d matched=%d totalOut=%d", dirCount, fileCount, matchCount, len(out))
+		if bdmvSkipped > 0 {
+			logger.S().Infof("[listAllFilesRecursive] 跳过 %d 个 BDMV/STREAM 原盘视频流（不生成 STRM）", bdmvSkipped)
+		}
 	}()
 	for len(stk) > 0 {
 		top := stk[len(stk)-1]
@@ -334,6 +338,16 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 				relName := e.Name
 				if top.relPath != "" {
 					relName = top.relPath + "/" + e.Name
+				}
+				cloudPath := originPath
+				if relName != "" {
+					cloudPath = strings.TrimRight(originPath, "/") + "/" + relName
+				}
+				// BDMV 原盘：跳过 BDMV/STREAM 层级（含其目录本身，不再向下遍历），
+				// 避免一个蓝光原盘被拆成上百个 m2ts STRM。ISO 原盘不受影响。
+				if model.IsBdmvStreamPath(cloudPath) {
+					bdmvSkipped++
+					continue
 				}
 				// isDir 判断：FsFiles 已经基于 cid/fid 做了可靠判定，这里直接复用，不再用 fc 覆盖。
 				isDir := e.IsDir
@@ -367,16 +381,11 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 				}
 				pageMatched++
 				matchCount++
-				cloudPath := originPath
-				if relName != "" {
-					cloudPath = strings.TrimRight(originPath, "/") + "/" + relName
-				}
-				fileID := fmt.Sprintf("%v", e.FID)
-				if fileID == "" || fileID == "<nil>" || fileID == "0" {
-					fileID = fmt.Sprintf("%v", e.CID)
+				fid := fmt.Sprintf("%v", e.FID)
+				if fid == "" || fid == "<nil>" || fid == "0" {
+					fid = fmt.Sprintf("%v", e.CID)
 				}
 				out = append(out, &fileItem{
-					FileID:    fileID,
 					CloudPath: cloudPath,
 					RelPath:   relName,
 					Name:      e.Name,
@@ -384,6 +393,8 @@ func listAllFilesRecursive( //nolint:cyclop // complexity: 30
 					Size:      e.Size,
 					Ext:       ext,
 					Kind:      kind,
+					FID:       fid,
+					ParentID:  strconv.FormatInt(top.cid, 10),
 				})
 			}
 			// 翻页
