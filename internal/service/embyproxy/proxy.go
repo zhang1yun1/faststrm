@@ -26,8 +26,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wabisabi926/faststrm/internal/service/strm"
@@ -240,6 +242,9 @@ type Proxy struct {
 	// 避免回落到与实际监听不一致的硬编码 80。
 	proxyPort int
 
+	// externalPlayersEnabled 是否启用外部播放器链接注入（默认关，由设置热更新）。
+	externalPlayersEnabled atomic.Bool
+
 	// httpClient 透传给 Emby 的客户端（不跟随重定向）
 	httpClient *http.Client
 	// followRedirectClient 用于解析重定向链拿最终 CDN URL（跟随所有重定向）
@@ -373,7 +378,8 @@ func (p *Proxy) Handler() http.Handler {
 	}
 
 	// 媒体流路径走 HandleMediaStream（查缓存/解析重定向链 → 302），其余透传反代
-	// 分发顺序：WS 升级 → system/info 端口改写 → JS 修补（crossOrigin）→ 媒体流拦截 → HTML 注入 → 透传
+	// 分发顺序：WS 升级 → system/info 端口改写 → 外部播放器唤起 → JS 修补（crossOrigin）
+	//          → 媒体流拦截 → 详情页 ExternalUrls 注入 → HTML 注入 → 透传
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
@@ -386,6 +392,12 @@ func (p *Proxy) Handler() http.Handler {
 		// 0.5 system/info：改写端口为代理自身端口，否则客户端会绕过代理直连 Emby 原端口
 		if isSystemInfoPath(path) {
 			p.serveSystemInfo(w, r)
+			return
+		}
+
+		// 0.6 外部播放器唤起跳转：/redirect2external?link=<base64>
+		if p.externalPlayersOn() && path == externalRedirectPath {
+			p.serveExternalRedirect(w, r)
 			return
 		}
 
@@ -405,6 +417,14 @@ func (p *Proxy) Handler() http.Handler {
 		if _, ok := matchMediaRoute(path); ok {
 			p.HandleMediaStream(w, r)
 			return
+		}
+
+		// 2.5 外部播放器：详情页 Items 响应注入 ExternalUrls 起播链接
+		if r.Method == http.MethodGet && p.externalPlayersOn() {
+			if _, ok := isExternalPlayerItemPath(path); ok {
+				p.serveItemExternalURLs(w, r)
+				return
+			}
 		}
 
 		// 3. 可能返回 Emby Web HTML 壳的 GET 请求：整包拉取并注入 crossOrigin 拦截脚本
@@ -448,6 +468,7 @@ func (p *Proxy) modifyPlaybackInfo(resp *http.Response) error {
 	if err := json.Unmarshal(body, &data); err != nil {
 		resp.Body = io.NopCloser(strings.NewReader(string(body)))
 		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		return nil
 	}
 
@@ -507,6 +528,7 @@ func (p *Proxy) modifyPlaybackInfo(resp *http.Response) error {
 	if !isStrm {
 		resp.Body = io.NopCloser(strings.NewReader(string(body)))
 		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		return nil
 	}
 
@@ -537,6 +559,11 @@ func (p *Proxy) modifyPlaybackInfo(resp *http.Response) error {
 	resp.Body = io.NopCloser(strings.NewReader(string(newBody)))
 	resp.ContentLength = int64(len(newBody))
 	resp.Header.Del("Content-Encoding")
+	// 必须同步改写 Content-Length 头：httputil.ReverseProxy 会把上游原始
+	// Content-Length 头原样透传给客户端，若与改写后的 body 长度不一致，
+	// 浏览器会以 net::ERR_CONTENT_LENGTH_MISMATCH 中断请求，表现为
+	// “当前没有兼容的流 / Failed to fetch” 的播放失败弹窗。
+	resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
 	return nil
 }
 
@@ -654,25 +681,43 @@ func mayReturnEmbyHTMLShell(path string) bool {
 	if strings.Contains(pl, "playbackinfo") {
 		return false
 	}
-	if path == "/" || path == "" {
+	if pl == "/" || pl == "" {
 		return true
 	}
-	if strings.HasPrefix(path, "/web/") || path == "/web" {
+	if strings.HasPrefix(pl, "/web/") || pl == "/web" {
 		return true
 	}
-	if strings.HasSuffix(path, ".html") || strings.HasSuffix(path, ".htm") {
+	if strings.HasSuffix(pl, ".html") || strings.HasSuffix(pl, ".htm") {
 		return true
 	}
-	if strings.HasPrefix(path, "/emby/") || strings.HasPrefix(path, "/items/") ||
-		strings.HasPrefix(path, "/videos/") || strings.HasPrefix(path, "/audio/") ||
-		strings.HasPrefix(path, "/sync/") {
+	if strings.HasPrefix(pl, "/emby/") || strings.HasPrefix(pl, "/items/") ||
+		strings.HasPrefix(pl, "/videos/") || strings.HasPrefix(pl, "/audio/") ||
+		strings.HasPrefix(pl, "/sync/") {
 		return false
 	}
-	last := path[strings.LastIndex(path, "/")+1:]
+	last := pl[strings.LastIndex(pl, "/")+1:]
 	if !strings.Contains(last, ".") {
 		return true
 	}
 	return false
+}
+
+// injectScriptAtHead 在 HTML 的 head 中插入 script：优先插到 </head> 之前，
+// 退而插到 <head...> 标签结束符之后；两者都没有时返回 (html, false)。
+func injectScriptAtHead(html, script string) (string, bool) {
+	lower := strings.ToLower(html)
+	// 优先 </head>（不区分大小写）
+	if idx := strings.Index(lower, "</head>"); idx != -1 {
+		return html[:idx] + script + html[idx:], true
+	}
+	// 退而找 <head...>，插入到标签结束符之后
+	if idx := strings.Index(lower, "<head"); idx != -1 {
+		if gt := strings.Index(html[idx:], ">"); gt != -1 {
+			end := idx + gt + 1
+			return html[:end] + script + html[end:], true
+		}
+	}
+	return html, false
 }
 
 // injectScriptsIntoHTML 在 HTML 的 head 中注入 crossOrigin 拦截脚本；
@@ -681,20 +726,18 @@ func injectScriptsIntoHTML(html string) string {
 	if strings.Contains(html, crossOriginInterceptMarker) {
 		return html
 	}
-	script := crossOriginInterceptScript
-	// 优先 </head>（不区分大小写）
-	lower := strings.ToLower(html)
-	if idx := strings.Index(lower, "</head>"); idx != -1 {
-		return html[:idx] + script + html[idx:]
+	out, _ := injectScriptAtHead(html, crossOriginInterceptScript)
+	return out
+}
+
+// injectExternalPlayerIntoHTML 在已有 crossOrigin 注入结果上，按需追加外部播放器按钮脚本；
+// 未启用或已注入（含 marker）时原样返回。
+func (p *Proxy) injectExternalPlayerIntoHTML(html string) string {
+	if !p.externalPlayersOn() || strings.Contains(html, externalPlayerMarker) {
+		return html
 	}
-	// 退而找 <head...>，插入到标签结束符之后
-	if idx := strings.Index(lower, "<head"); idx != -1 {
-		if gt := strings.Index(html[idx:], ">"); gt != -1 {
-			end := idx + gt + 1
-			return html[:end] + script + html[end:]
-		}
-	}
-	return html
+	out, _ := injectScriptAtHead(html, buildExternalPlayerScript())
+	return out
 }
 
 // patchBasehtmlplayerJS 修补 getCrossOriginValue 相关逻辑，使其恒返回 null（不设置 crossorigin）。
@@ -765,10 +808,11 @@ func (p *Proxy) serveHTMLInjected(w http.ResponseWriter, r *http.Request) {
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	if resp.StatusCode == http.StatusOK && strings.Contains(ct, "text/html") {
 		html := string(body)
-		if newHTML := injectScriptsIntoHTML(html); newHTML != html {
+		newHTML := p.injectExternalPlayerIntoHTML(injectScriptsIntoHTML(html))
+		if newHTML != html {
 			out = []byte(newHTML)
 			injected = true
-			logger.S().Infof("[EmbyProxy] 已在 HTML 注入 crossOrigin 脚本: path=%s", r.URL.Path)
+			logger.S().Infof("[EmbyProxy] 已在 HTML 注入脚本: path=%s", r.URL.Path)
 		}
 	}
 
@@ -878,9 +922,21 @@ func isSeekRequiredFormat(container, name string) bool {
 	return false
 }
 
+// disableWriteDeadline 清除当前响应的写截止时间。
+// http.Server 的 WriteTimeout 是「读完请求头起算」的绝对截止时间，
+// 一旦超过（默认 120s）就会切断正在持续写入的长流（ISO/原盘等大文件播放、
+// 媒体流转发），客户端表现为播放中途断开。流式 handler 在开始拷贝 body 前
+// 调用本函数，仅对该请求解除写超时；其余请求仍受 server WriteTimeout 保护。
+func disableWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+}
+
 // proxyStreamToStrm 将媒体流请求透传给 FastStrm 自身 STRM 端点（/api/strm?...），
 // 由 STRM handler 层走 proxy 模式转发 Range 到 115 CDN，保证 ISO/原盘 seek 正常。
 func (p *Proxy) proxyStreamToStrm(w http.ResponseWriter, r *http.Request, strmURL string) {
+	// 长流：解除写超时，避免大文件连续播放被 120s WriteTimeout 截断
+	disableWriteDeadline(w)
+
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, strmURL, nil)
 	if err != nil {
 		logger.S().Warnf("[EmbyProxy] proxyStreamToStrm: 构造请求失败: %v", err)
@@ -999,9 +1055,20 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ===== 步骤 2: 解析重定向链拿最终 CDN URL =====
-	finalURL := p.resolveRedirectChain(r.Context(), meta.path, r, userID)
-	if finalURL != meta.path {
-		logger.S().Infof("[EmbyProxy] resolveRedirectChain: item=%s %s -> %s", itemID, meta.path, finalURL)
+	// 对齐 MoviePilot `_resolve_redirect`：解析失败（超时 / STRM 端点报错）时返回原始
+	// STRM URL，由客户端再走一次 STRM 端点，而不是在代理侧直接报 502。
+	// upstreamStatus 仅用于诊断日志（响应行为不变），MP 本身对 4xx/5xx 是静默的。
+	finalURL, upstreamStatus := p.resolveRedirectChain(r.Context(), meta.path, r, userID)
+	if finalURL == meta.path {
+		if upstreamStatus >= http.StatusBadRequest {
+			logger.S().Warnf("[EmbyProxy] media 直链解析失败: STRM 端点返回 %d，疑似 115 Cookie 失效/直链过期，302 回退原始 STRM URL: item=%s source=%s strm=%s",
+				upstreamStatus, itemID, sourceID, meta.path)
+		} else {
+			logger.S().Warnf("[EmbyProxy] media 直链解析未成功（上游无响应/超时），302 回退原始 STRM URL: item=%s source=%s strm=%s",
+				itemID, sourceID, meta.path)
+		}
+	} else {
+		logger.S().Infof("[EmbyProxy] resolveRedirectChain: item=%s %s -> %s (status=%d)", itemID, meta.path, finalURL, upstreamStatus)
 	}
 
 	// ===== 步骤 3: 缓存最终 URL 并 302 =====
@@ -1014,6 +1081,9 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 // passthroughToEmby 透传媒体流请求到 Emby 真实地址
 func (p *Proxy) passthroughToEmby(w http.ResponseWriter, r *http.Request) {
+	// 长流：解除写超时，避免大文件连续播放被 120s WriteTimeout 截断
+	disableWriteDeadline(w)
+
 	target := p.embyHost + r.URL.Path + "?" + r.URL.RawQuery
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 	if err != nil {
@@ -1031,9 +1101,15 @@ func (p *Proxy) passthroughToEmby(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for k, v := range resp.Header {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
+	// 回写响应头（过滤 hop-by-hop + set-cookie，与其它 handler 保持一致，
+	// 避免 transfer-encoding/connection 等被错误透传，或泄漏 Emby 会话 cookie）
+	for k, vv := range resp.Header {
+		lk := strings.ToLower(k)
+		if hopByHopHeaders[lk] || lk == "set-cookie" {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
@@ -1045,10 +1121,17 @@ func (p *Proxy) passthroughToEmby(w http.ResponseWriter, r *http.Request) {
 // 对齐 MoviePilot _resolve_redirect
 // ============================================================
 
-// resolveRedirectChain 对起始 URL 发 HEAD 请求，跟随所有重定向拿到最终 URL
-// 使用渐进超时策略（3 次重试，每次更长）
-// 失败时返回原始 url（让调用方 fallback 到其他策略）
-func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *http.Request, userID string) string {
+// resolveRedirectChain 对起始 URL 发 HEAD 请求，跟随所有重定向拿到最终 URL。
+// 使用渐进超时策略（3 次重试，每次更长）。
+//
+// 对齐 MoviePilot `_resolve_redirect`：无论成功与否都返回一个可用 URL——
+// 解析成功返回跟随重定向后的最终 URL；构造失败 / 传输超时 / STRM 端点自身报错
+// 时原样返回 startURL，交给调用方 302 给客户端，由客户端再走一次 STRM 端点，
+// 与 MP 保持一致的降级行为（不在代理侧直接报 502）。
+//
+// 第二个返回值是上游最终 HTTP 状态码（仅用于调用方诊断日志，不影响响应行为）：
+// 无 HTTP 响应（构造失败/超时）时为 0，其余为 resp.StatusCode。
+func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *http.Request, userID string) (string, int) {
 	fwdHeaders := buildForwardHeaders(r)
 	if userID != "" {
 		fwdHeaders["X-Emby-UserId"] = userID
@@ -1060,8 +1143,8 @@ func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *ht
 		req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, startURL, nil)
 		if err != nil {
 			cancel()
-			logger.S().Warnf("[EmbyProxy] resolveRedirectChain: 构造 HEAD 请求失败: %v", err)
-			return startURL
+			logger.S().Warnf("[EmbyProxy] resolveRedirectChain: 构造 HEAD 请求失败，回退原始 URL: %v", err)
+			return startURL, 0
 		}
 		for k, v := range fwdHeaders {
 			req.Header.Set(k, v)
@@ -1071,26 +1154,28 @@ func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *ht
 		resp, err := p.followRedirectClient.Do(req)
 		if err != nil {
 			cancel()
-			// 超时 → 重试（最后一次超时则放弃）
+			// 超时 → 重试（最后一次超时则回退原始 URL）
 			if attempt < len(redirectResolveTimeouts)-1 {
 				logger.S().Infof("[EmbyProxy] resolveRedirectChain 超时，重试 %d/%d: url=%s err=%v",
 					attempt+1, len(redirectResolveTimeouts), startURL, err)
 				continue
 			}
-			logger.S().Warnf("[EmbyProxy] resolveRedirectChain 最终失败: url=%s err=%v", startURL, err)
-			return startURL
+			logger.S().Warnf("[EmbyProxy] resolveRedirectChain 最终失败，回退原始 URL: url=%s err=%v", startURL, err)
+			return startURL, 0
 		}
 
-		// resp.Request.URL 是跟随所有重定向后的最终 URL
+		// resp.Request.URL 是跟随所有重定向后的最终 URL；未发生重定向时即 startURL
+		// （例如 STRM 端点自身返回 4xx/5xx，此时 finalURL == startURL，交给客户端再走一次）。
 		finalURL := resp.Request.URL.String()
+		status := resp.StatusCode
 		resp.Body.Close()
 		cancel()
 
-		logger.S().Debugf("[EmbyProxy] resolveRedirectChain: %s -> %s (attempt %d)", startURL, finalURL, attempt+1)
-		return finalURL
+		logger.S().Debugf("[EmbyProxy] resolveRedirectChain: %s -> %s (status=%d attempt=%d)", startURL, finalURL, status, attempt+1)
+		return finalURL, status
 	}
 
-	return startURL
+	return startURL, 0
 }
 
 // ============================================================
@@ -1281,19 +1366,29 @@ func isHTTPPath(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// extractAPIKey 从请求头提取 Emby API Key：
-// 优先 X-Emby-Token，其次 Authorization: MediaBrowser Token="xxx" / Token="xxx"
+// extractAPIKey 提取 Emby API Key：
+// 优先请求头 X-Emby-Token，其次 Authorization: MediaBrowser Token="xxx" / Token="xxx"，
+// 最后兜底 URL 查询参数。Emby Web 的详情页 Items 等 GET 请求会把令牌放在
+// ?X-Emby-Token=（而非请求头），不兜底会导致外部播放器注入等依赖 apiKey 的功能静默失效。
 func extractAPIKey(r *http.Request) string {
 	if tk := strings.TrimSpace(r.Header.Get("X-Emby-Token")); tk != "" {
 		return tk
 	}
-	auth := r.Header.Get("Authorization")
-	if auth == "" {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if idx := strings.Index(auth, "Token="); idx != -1 {
+			if tk := strings.Trim(auth[idx+len("Token="):], `"' `); tk != "" {
+				return tk
+			}
+		}
+	}
+	if r.URL == nil {
 		return ""
 	}
-	if idx := strings.Index(auth, "Token="); idx != -1 {
-		tk := auth[idx+len("Token="):]
-		return strings.Trim(tk, `"' `)
+	q := r.URL.Query()
+	for _, k := range []string{"X-Emby-Token", "api_key", "X-MediaBrowser-Token"} {
+		if tk := strings.TrimSpace(q.Get(k)); tk != "" {
+			return tk
+		}
 	}
 	return ""
 }

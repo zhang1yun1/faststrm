@@ -179,6 +179,46 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 		return ExecuteResult{Success: false, Reason: "bad_account", Message: msg}
 	}
 
+	// 4.5) 前置权威探测：Cookie 已失效则快速失败，避免大库任务白跑一趟
+	probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+	probeErr := client115.ProbeAccount(probeCtx, account.Cookie)
+	probeCancel()
+	probeStatus := model.CookieStatusUnknown
+	if probeErr == nil {
+		probeStatus = model.CookieStatusValid
+	} else if client115.IsAuthError(probeErr) {
+		probeStatus = model.CookieStatusInvalid
+	}
+	// 无论结果如何都回写状态：unknown 不会覆盖已知状态，仅刷新排查信息
+	_ = deps.AccountStore.SetCookieStatus(task.Account, probeStatus, client115.ErrnoOf(probeErr), model.CookieSourceProbe)
+	if client115.IsAuthError(probeErr) {
+		detail := ""
+		if e := client115.ErrnoOf(probeErr); e != 0 {
+			detail = fmt.Sprintf("（errno=%d）", e)
+		}
+		msg := "115 账号 Cookie 已失效，请重新登录后再执行任务" + detail
+		histSuccess = false
+		histErrMsg = msg
+		sseServer.EmitLog(task.ID, "error", msg)
+		rt.SetState(task.ID, func(s *RuntimeState) {
+			s.Status = StatusFailed
+			s.Error = msg
+			s.EndedAt = time.Now().UnixMilli()
+			s.Stage = StageFailed
+			s.StageDetail = msg
+		})
+		sseServer.EmitComplete(sse.CompletePayload{
+			TaskID: task.ID, Status: string(StatusFailed), Error: msg, DurationMs: time.Since(taskStart).Milliseconds(),
+		})
+		if deps.Notifier != nil {
+			_ = deps.Notifier.NotifyError(context.Background(), task.Name, msg)
+		}
+		return ExecuteResult{Success: false, Reason: "cookie_expired", Message: msg}
+	}
+	if probeErr != nil {
+		sseServer.EmitLog(task.ID, "warn", "账号存活探测未确认（可能是风控/网络）："+probeErr.Error())
+	}
+
 	// 5) 合并全局 settings + 任务覆盖得到最终 strm 配置
 	settings, err := deps.SettingsStore.ReadSettings()
 	if err != nil { //nolint:staticcheck // SA9003: 空分支为有意设计
@@ -292,6 +332,8 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 			incremental = false
 		} else if len(snap) > 0 {
 			skipped := 0
+			repaired := 0
+			strmTemplate := settings.Strm.StrmFilenameTemplate
 			for _, f := range fileEntries {
 				// kindSkip 已跳过的不重复处理（黑名单/过小的）
 				if f.Kind == kindSkip {
@@ -300,9 +342,19 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 				if se, ok := snap[f.CloudPath]; ok &&
 					se.PickCode == f.PickCode &&
 					se.FileName == f.Name {
+					// 增量跳过前必须确认本地产物仍存在：本地 STRM/文件被误删后，
+					// 若仅凭快照命中就跳过，将永远不会被补回（漏生成无法自愈）。
+					if !localArtifactExists(task, strmTemplate, f) {
+						repaired++
+						continue
+					}
 					f.Kind = kindSkip
 					skipped++
 				}
+			}
+			if repaired > 0 {
+				sseServer.EmitLog(task.ID, "warn", fmt.Sprintf(
+					"增量模式：检测到 %d 个文件本地缺失，已强制重新生成/下载（不跳过）", repaired))
 			}
 			if skipped > 0 {
 				sseServer.EmitLog(task.ID, "info", fmt.Sprintf(
@@ -490,27 +542,12 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 		// P2-1：统一用 WorkerPool，不再每处手写 sem+wg 模板
 		pool := concurrency.NewPool(strmWorkers)
 		skipped := new(int64)
+		writeFailed := new(int64)
 		for _, f := range strmFiles {
 			f := f
 			pool.Submit(func() error {
 				// P1-4 文件名模板优先，否则回退默认（.iso 保留双扩展名）
-				var strmRelPath string
-				if strmFilenameTemplate != "" {
-					relDir, relName := filepath.Split(f.RelPath)
-					ext := strings.ToLower(filepath.Ext(f.Name))
-					stem := strings.TrimSuffix(f.Name, filepath.Ext(f.Name))
-					if strings.EqualFold(ext, ".iso") {
-						stem = stem + ".iso"
-					}
-					newName := model.RenderStrmFilenameTemplate(strmFilenameTemplate, f.Name, ext, stem, task.Account)
-					if newName == "" {
-						newName = getStrmFileName(relName)
-					}
-					strmRelPath = filepath.Join(relDir, newName)
-				} else {
-					// 默认：正确处理 .iso 双扩展名：f.RelPath = "sub/game.iso" → "sub/game.iso.strm"
-					strmRelPath = replaceRelPathExtToStrm(f.RelPath)
-				}
+				strmRelPath := resolveStrmRelPath(strmFilenameTemplate, task.Account, f)
 				savePath := filepath.Join(task.TargetPath, strmRelPath)
 				// 对齐 MoviePilot：overwrite_mode=="never" 且文件已存在 → 跳过
 				if overwriteNever {
@@ -521,15 +558,18 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 				}
 				content, cerr := buildStrmContent(task, f, resolved, strmUrlTemplate)
 				if cerr != nil {
+					atomic.AddInt64(writeFailed, 1)
 					sseServer.EmitLog(task.ID, "error", fmt.Sprintf("build strm %s: %v", f.RelPath, cerr))
 					return nil
 				}
 				if cerr = ensureDir(filepath.Dir(savePath)); cerr != nil {
+					atomic.AddInt64(writeFailed, 1)
 					sseServer.EmitLog(task.ID, "error", fmt.Sprintf("mkdir %s: %v", filepath.Dir(savePath), cerr))
 					return nil
 				}
 				// 原子写入：先写 tmp 再 rename，避免并发读到半截文件
 				if cerr = writeStrmFile(savePath, content); cerr != nil {
+					atomic.AddInt64(writeFailed, 1)
 					sseServer.EmitLog(task.ID, "error", fmt.Sprintf("write %s: %v", savePath, cerr))
 					return nil
 				}
@@ -558,6 +598,12 @@ func ExecuteTask(ctx context.Context, taskID string, deps ExecutorDeps) ExecuteR
 		pool.Wait()
 		if overwriteNever && skipped != nil && *skipped > 0 {
 			sseServer.EmitLog(task.ID, "info", fmt.Sprintf("overwrite=never：已跳过 %d 个已存在 STRM 文件", *skipped))
+		}
+		if writeFailed != nil && *writeFailed > 0 {
+			// 写入失败此前只打日志、不计数，导致任务显示成功但实际漏了一批文件。
+			msg := fmt.Sprintf("STRM 生成失败 %d 个（详见上方错误日志），请检查目标目录权限/磁盘空间后重跑", *writeFailed)
+			logger.S().Errorf("[Task] %s", msg)
+			sseServer.EmitLog(task.ID, "warn", msg)
 		}
 	}
 

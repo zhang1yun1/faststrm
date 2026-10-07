@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zeromicro/go-zero/rest/httpx"
@@ -84,31 +86,36 @@ func CreateAccount(accountStore *store.AccountStore) http.HandlerFunc {
 			return
 		}
 
-		now := time.Now().UnixMilli()
-		cookieValid := true
+		// 格式完整不代表 Cookie 存活：格式校验仅用于判定「缺字段=invalid」，
+		// 其余一律先记 unknown，等权威探测/监控给出有效结论，避免假阳性。
+		status := model.CookieStatusUnknown
 		if req.AccountType == "115" && req.Cookie != "" {
-			result := client115.ValidateCookie(req.Cookie)
-			cookieValid = result.Valid
-			if !result.Valid {
+			if result := client115.ValidateCookie(req.Cookie); !result.Valid {
+				status = model.CookieStatusInvalid
 				logger.S().Warnf("[CreateAccount] Cookie 格式无效 account=%s 缺少: %s", req.Name, strings.Join(result.Missing, ","))
 			}
 		}
 
 		newAcc := &model.AccountInfo{
-			Name:            req.Name,
-			AccountType:     req.AccountType,
-			Cookie:          req.Cookie,
-			Account:         req.Account,
-			Password:        req.Password,
-			URL:             req.URL,
-			LastCookieCheck: now,
-			CookieValid:     &cookieValid,
+			Name:        req.Name,
+			AccountType: req.AccountType,
+			Cookie:      req.Cookie,
+			Account:     req.Account,
+			Password:    req.Password,
+			URL:         req.URL,
 		}
 
 		if err := accountStore.Upsert(newAcc); err != nil {
 			logger.S().Errorf("upsert account: %v", err)
 			httpx.WriteJson(w, http.StatusInternalServerError, map[string]string{"error": "保存账号失败"})
 			return
+		}
+
+		// 统一经 SetCookieStatus 写入三态（同时刷新 LastCookieCheck），仅 115 账号有意义。
+		if req.AccountType == "115" {
+			if err := accountStore.SetCookieStatus(req.Name, status, 0, model.CookieSourceFormat); err != nil {
+				logger.S().Warnf("[CreateAccount] 写入 Cookie 状态失败 account=%s: %v", req.Name, err)
+			}
 		}
 
 		if err := accountStore.Flush(); err != nil {
@@ -176,14 +183,12 @@ func UpdateAccount(accountStore *store.AccountStore) http.HandlerFunc { //nolint
 			}
 		}
 
-		now := time.Now().UnixMilli()
-		cookieValid := true
-		if req.AccountType == "115" {
-			if cookieChanged {
-				result := client115.ValidateCookie(req.Cookie)
-				cookieValid = result.Valid
-			} else if acc.CookieValid != nil {
-				cookieValid = *acc.CookieValid
+		// 与 CreateAccount 一致：格式校验仅用于判定「缺字段=invalid」，其余记 unknown；
+		// 未改 Cookie 时记 unknown（unknown 不覆盖既有的 valid/invalid 明确状态）。
+		status := model.CookieStatusUnknown
+		if req.AccountType == "115" && cookieChanged {
+			if result := client115.ValidateCookie(req.Cookie); !result.Valid {
+				status = model.CookieStatusInvalid
 			}
 		}
 
@@ -206,8 +211,10 @@ func UpdateAccount(accountStore *store.AccountStore) http.HandlerFunc { //nolint
 			if req.URL != "" {
 				acc.URL = req.URL
 			}
-			acc.LastCookieCheck = now
-			acc.CookieValid = &cookieValid
+			if cookieChanged {
+				// Cookie 已变更：旧存活结论作废，交由后续 SetCookieStatus 重新判定
+				acc.ResetCookieStatus()
+			}
 			if err := accountStore.Delete(lookupName); err != nil {
 				httpx.WriteJson(w, http.StatusInternalServerError, map[string]string{"error": "更新账号失败"})
 				return
@@ -233,12 +240,21 @@ func UpdateAccount(accountStore *store.AccountStore) http.HandlerFunc { //nolint
 				if req.URL != "" {
 					a.URL = req.URL
 				}
-				a.LastCookieCheck = now
-				a.CookieValid = &cookieValid
+				if cookieChanged {
+					// Cookie 已变更：旧存活结论作废，交由后续 SetCookieStatus 重新判定
+					a.ResetCookieStatus()
+				}
 			})
 			if err != nil {
 				httpx.WriteJson(w, http.StatusNotFound, map[string]string{"error": "账户不存在"})
 				return
+			}
+		}
+
+		// 统一经 SetCookieStatus 写入三态（同时刷新 LastCookieCheck），仅 115 账号有意义。
+		if req.AccountType == "115" {
+			if err := accountStore.SetCookieStatus(req.Name, status, 0, model.CookieSourceFormat); err != nil {
+				logger.S().Warnf("[UpdateAccount] 写入 Cookie 状态失败 account=%s: %v", req.Name, err)
 			}
 		}
 
@@ -421,15 +437,15 @@ func GetQrcodeCookieHandler(c *client115.Client, accountStore *store.AccountStor
 				return
 			}
 
-			now := time.Now().UnixMilli()
-			valid := true
 			if err := accountStore.Update(req.AccountName, func(a *model.AccountInfo) {
 				a.Cookie = cookie
-				a.LastCookieCheck = now
-				a.CookieValid = &valid
 			}); err != nil {
 				httpx.WriteJson(w, http.StatusInternalServerError, map[string]string{"error": "保存账号失败"})
 				return
+			}
+			// 扫码登录成功即视为有效，来源标记 login（统一经三态通道写入）。
+			if err := accountStore.SetCookieStatus(req.AccountName, model.CookieStatusValid, 0, model.CookieSourceLogin); err != nil {
+				logger.S().Warnf("[QRCODE-LOGIN] 写入 Cookie 状态失败 account=%s: %v", req.AccountName, err)
 			}
 			if err := accountStore.Flush(); err != nil {
 				logger.S().Warnf("flush account after cookie update: %v", err)
@@ -465,6 +481,12 @@ type AccountStatusInfo struct {
 	Message         string `json:"message,omitempty"`
 	CookieValid     *bool  `json:"cookieValid,omitempty"`
 	LastCookieCheck int64  `json:"lastCookieCheck,omitempty"`
+	// CookieStatus 三态状态：valid / invalid / unknown。
+	CookieStatus string `json:"cookieStatus,omitempty"`
+	// CookieErrno 最近一次判定拿到的 115 错误码。
+	CookieErrno int `json:"cookieErrno,omitempty"`
+	// CookieSource 最近一次判定来源。
+	CookieSource string `json:"cookieSource,omitempty"`
 }
 
 // GetAccountStatus GET /api/account/status?names=xxx,yyy&deep=true
@@ -506,16 +528,18 @@ func GetAccountStatus(accountStore *store.AccountStore) http.HandlerFunc {
 			deepResults = make([]map[string]any, 0, len(targets))
 			for _, acc := range targets {
 				if acc.AccountType == "115" && acc.Cookie != "" {
-					pingOk, pingMsg := client115.PingCookie(acc.Cookie)
-					// 根据真实结果更新 store 中的 CookieValid
-					validBool := pingOk
-					_ = accountStore.MarkCookieStatus(acc.Name, validBool)
+					ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+					probeErr := client115.ProbeAccount(ctx, acc.Cookie)
+					cancel()
+					status := classifyProbeStatus(probeErr)
+					_ = accountStore.SetCookieStatus(acc.Name, status, client115.ErrnoOf(probeErr), model.CookieSourceProbe)
 					deepResults = append(deepResults, map[string]any{
 						"account":   acc.Name,
 						"type":      "115",
-						"valid":     pingOk,
+						"valid":     status == model.CookieStatusValid,
+						"status":    status,
 						"missing":   []string{},
-						"error":     pingMsg,
+						"error":     probeMessage(probeErr),
 						"checkedAt": now,
 					})
 				} else if acc.AccountType == "115" && acc.Cookie == "" {
@@ -556,6 +580,9 @@ func checkAccountStatusInfo(acc model.AccountInfo) AccountStatusInfo {
 		Name:            acc.Name,
 		CookieValid:     acc.CookieValid,
 		LastCookieCheck: acc.LastCookieCheck,
+		CookieStatus:    acc.EffectiveCookieStatus(),
+		CookieErrno:     acc.CookieErrno,
+		CookieSource:    acc.CookieSource,
 	}
 
 	switch acc.AccountType {
@@ -571,11 +598,21 @@ func checkAccountStatusInfo(acc model.AccountInfo) AccountStatusInfo {
 			info.Message = "Cookie 缺少字段: " + strings.Join(result.Missing, ", ")
 			return info
 		}
-		info.Status = "ok"
-		info.Message = "Cookie 格式有效"
+		// 格式完整不代表存活：状态由三态判定（权威探测/监控）驱动。
+		timeStr := ""
 		if acc.LastCookieCheck > 0 {
-			checkedAt := time.UnixMilli(acc.LastCookieCheck)
-			info.Message += fmt.Sprintf(" (校验于 %s)", checkedAt.Format("2006-01-02 15:04:05"))
+			timeStr = fmt.Sprintf(" (校验于 %s)", time.UnixMilli(acc.LastCookieCheck).Format("2006-01-02 15:04:05"))
+		}
+		switch acc.EffectiveCookieStatus() {
+		case model.CookieStatusInvalid:
+			info.Status = "error"
+			info.Message = "Cookie 已失效，请重新登录" + errnoSuffix(acc.CookieErrno) + timeStr
+		case model.CookieStatusValid:
+			info.Status = "ok"
+			info.Message = "Cookie 有效" + timeStr
+		default:
+			info.Status = "ok"
+			info.Message = "Cookie 格式有效，待存活校验" + timeStr
 		}
 		return info
 	case "openlist":
@@ -594,10 +631,45 @@ func checkAccountStatusInfo(acc model.AccountInfo) AccountStatusInfo {
 	}
 }
 
+// classifyProbeStatus 将探测错误映射为三态状态。
+func classifyProbeStatus(err error) string {
+	switch {
+	case err == nil:
+		return model.CookieStatusValid
+	case client115.IsAuthError(err):
+		return model.CookieStatusInvalid
+	default:
+		// 风控/临时错误：不改写账号状态
+		return model.CookieStatusUnknown
+	}
+}
+
+// probeMessage 生成探测结果的可读文案。
+func probeMessage(err error) string {
+	if err == nil {
+		return "Cookie 有效"
+	}
+	if client115.IsAuthError(err) {
+		return "Cookie 已失效，请重新登录: " + err.Error()
+	}
+	if client115.IsRateLimitError(err) {
+		return "疑似风控/限流，暂不判定: " + err.Error()
+	}
+	return "暂时无法验证: " + err.Error()
+}
+
+// errnoSuffix 拼接错误码后缀（0 时不显示）。
+func errnoSuffix(errno int) string {
+	if errno == 0 {
+		return ""
+	}
+	return fmt.Sprintf("（errno=%d）", errno)
+}
+
 // ==================== Cookie 验证 API ====================
 
 // VerifyAccountHandler POST /api/account/verify?name=xxx
-// 对单个账号执行 cookie 格式校验并更新元数据
+// 对单个 115 账号执行权威存活探测（ProbeAccount），返回三态状态并回写账号。
 func VerifyAccountHandler(accountStore *store.AccountStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
@@ -620,17 +692,31 @@ func VerifyAccountHandler(accountStore *store.AccountStore) http.HandlerFunc {
 			httpx.WriteJson(w, http.StatusNotFound, map[string]string{"error": "账户不存在"})
 			return
 		}
-
-		valid, missing, err := accountStore.ValidateCookie(name)
-		if err != nil {
-			httpx.WriteJson(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if acc.AccountType != "115" || acc.Cookie == "" {
+			httpx.WriteJson(w, http.StatusBadRequest, map[string]string{"error": "仅 115 账号支持存活验证"})
 			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		probeErr := client115.ProbeAccount(ctx, acc.Cookie)
+		status := classifyProbeStatus(probeErr)
+		if err := accountStore.SetCookieStatus(name, status, client115.ErrnoOf(probeErr), model.CookieSourceProbe); err != nil {
+			logger.S().Warnf("[VerifyAccount] 写入 Cookie 状态失败 account=%s: %v", name, err)
 		}
 		accountStore.Flush()
 
+		missing := client115.ValidateCookie(acc.Cookie).Missing
+		if missing == nil {
+			missing = []string{}
+		}
 		httpx.OkJson(w, map[string]any{
 			"account":   name,
-			"valid":     valid,
+			"status":    status,
+			"valid":     status == model.CookieStatusValid, // 兼容旧前端
+			"errno":     client115.ErrnoOf(probeErr),
+			"source":    model.CookieSourceProbe,
+			"message":   probeMessage(probeErr),
 			"missing":   missing,
 			"checkedAt": time.Now().UnixMilli(),
 		})
@@ -638,32 +724,66 @@ func VerifyAccountHandler(accountStore *store.AccountStore) http.HandlerFunc {
 }
 
 // VerifyAllAccountsHandler POST /api/account/verify-all
-// 批量校验所有 115 账号的 cookie
+// 并发对所有 115 账号执行权威存活探测，逐个回写三态状态。
 func VerifyAllAccountsHandler(accountStore *store.AccountStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		validCount, invalidCount, err := accountStore.ValidateAllCookies()
-		if err != nil {
-			httpx.WriteJson(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		accountStore.Flush()
+		const maxConcurrency = 4
+		sem := make(chan struct{}, maxConcurrency)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 
-		accounts := accountStore.List()
-		results := make([]map[string]any, 0, len(accounts))
-		for _, acc := range accounts {
-			if acc.AccountType == "115" {
-				results = append(results, map[string]any{
-					"account":     acc.Name,
-					"cookieValid": acc.CookieValid,
-					"lastCheck":   acc.LastCookieCheck,
-				})
+		targets := make([]*model.AccountInfo, 0)
+		for _, acc := range accountStore.List() {
+			if acc.AccountType == "115" && acc.Cookie != "" {
+				targets = append(targets, acc)
 			}
 		}
+
+		results := make([]map[string]any, 0, len(targets))
+		validCount, invalidCount, unknownCount := 0, 0, 0
+		for _, acc := range targets {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(a *model.AccountInfo) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+				defer cancel()
+				probeErr := client115.ProbeAccount(ctx, a.Cookie)
+				status := classifyProbeStatus(probeErr)
+				errno := client115.ErrnoOf(probeErr)
+				if err := accountStore.SetCookieStatus(a.Name, status, errno, model.CookieSourceProbe); err != nil {
+					logger.S().Warnf("[VerifyAll] 写入 Cookie 状态失败 account=%s: %v", a.Name, err)
+				}
+
+				mu.Lock()
+				switch status {
+				case model.CookieStatusValid:
+					validCount++
+				case model.CookieStatusInvalid:
+					invalidCount++
+				default:
+					unknownCount++
+				}
+				results = append(results, map[string]any{
+					"account": a.Name,
+					"status":  status,
+					"valid":   status == model.CookieStatusValid,
+					"errno":   errno,
+					"message": probeMessage(probeErr),
+				})
+				mu.Unlock()
+			}(acc)
+		}
+		wg.Wait()
+		accountStore.Flush()
 
 		httpx.OkJson(w, map[string]any{
 			"validCount":   validCount,
 			"invalidCount": invalidCount,
-			"total":        validCount + invalidCount,
+			"unknownCount": unknownCount,
+			"total":        len(targets),
 			"results":      results,
 			"checkedAt":    time.Now().UnixMilli(),
 		})

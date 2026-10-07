@@ -138,6 +138,7 @@ type embySettingsPatch struct {
 	RefreshOnDelete          *bool                          `json:"refreshOnDelete,omitempty"`
 	DebounceSeconds          *int                           `json:"debounceSeconds,omitempty"`
 	ProxyPort                *int                           `json:"proxyPort,omitempty"`
+	ExternalPlayerEnabled    *bool                          `json:"externalPlayerEnabled,omitempty"`
 }
 
 // HandleEmbySettingsPOST POST /api/emby/settings 局部 patch 保存 Emby 设置
@@ -226,6 +227,9 @@ func HandleEmbySettingsPOST(deps EmbyDeps) http.HandlerFunc {
 		if patch.ProxyPort != nil {
 			em.ProxyPort = *patch.ProxyPort
 		}
+		if patch.ExternalPlayerEnabled != nil {
+			em.ExternalPlayerEnabled = *patch.ExternalPlayerEnabled
+		}
 		settings.Emby = em
 
 		if err := deps.SettingsStore.SaveSettings(settings); err != nil {
@@ -265,6 +269,8 @@ func HandleEmbySettingsPOST(deps EmbyDeps) http.HandlerFunc {
 					mgr.StopAll()
 				}
 			}
+			// 外部播放器开关热更新（无需重启反代 server）
+			mgr.SetExternalPlayers(em.ExternalPlayerEnabled)
 		}
 
 		// 返回保存后的配置（apiKey 脱敏）
@@ -477,6 +483,18 @@ func HandleSettingsPOST(deps EmbyDeps) http.HandlerFunc { //nolint:cyclop // com
 				settings.Download.DownloadMaxConcurrent = body.Download.DownloadMaxConcurrent
 			}
 			settings.Download.AutoDownloadMetadata = body.Download.AutoDownloadMetadata
+			// 增量同步全局开关（前端始终发送全量对象，直接覆盖）
+			settings.Download.IncrementalSync = body.Download.IncrementalSync
+			// 全局文件过滤：最小文件大小阈值（字节），前端始终发送全量值，直接覆盖
+			settings.Download.MinFileSize = body.Download.MinFileSize
+			// 全局文件过滤：文件名黑名单（nil 表示未提供，保留旧值；空数组表示用户主动清空）
+			if body.Download.StrmGenerateBlacklist != nil {
+				settings.Download.StrmGenerateBlacklist = body.Download.StrmGenerateBlacklist
+			}
+			// STRM 覆盖模式："always"(默认覆盖) / "never"(已存在则跳过)；空值表示未提供，保留旧配置
+			if body.Download.OverwriteMode != "" {
+				settings.Download.OverwriteMode = body.Download.OverwriteMode
+			}
 		}
 
 		// ====== STRM 嵌套对象 ======

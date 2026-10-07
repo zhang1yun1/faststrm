@@ -1067,7 +1067,8 @@ func TestHandleMediaStream_StrmURLMiss_Passthrough(t *testing.T) {
 	t.Logf("✅ No cache → passthrough to Emby (status=%d)", rr.Code)
 }
 
-// TestResolveRedirectChain_HTTPError 模拟 CDN 返回 404/500 → 优雅降级（不 hang）
+// TestResolveRedirectChain_HTTPError 模拟 CDN 返回 403 → 优雅降级（不 hang）
+// 对齐 MP：解析不成功时回退原始 URL，保证调用方总能拿到可 302 的地址。
 func TestResolveRedirectChain_HTTPError(t *testing.T) {
 	// 模拟坏 CDN：HEAD 返回 403 Forbidden
 	badCDN := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1081,14 +1082,79 @@ func TestResolveRedirectChain_HTTPError(t *testing.T) {
 
 	proxy, _ := New(emby.URL)
 
+	startURL := badCDN.URL + "/expired.iso"
 	req, _ := http.NewRequest("GET", "/Videos/123/stream", nil)
-	finalURL := proxy.resolveRedirectChain(context.Background(), badCDN.URL+"/expired.iso", req, "u1")
+	finalURL, status := proxy.resolveRedirectChain(context.Background(), startURL, req, "u1")
 
-	// 关键：不能 hang，必须返回空字符串（不是 panic）
-	if finalURL != "" {
-		t.Logf("  unexpected got finalURL=%q (should be empty on error)", finalURL)
+	// 关键：不能 hang；403 未发生重定向 → 回退原始 URL（对齐 MP）
+	if finalURL != startURL {
+		t.Fatalf("403 无重定向时应回退原始 URL %q，got %q", startURL, finalURL)
 	}
-	t.Logf("✅ HTTP error (403) handled gracefully, no hang/panic, finalURL=%q", finalURL)
+	// 诊断日志需要用到上游状态码
+	if status != http.StatusForbidden {
+		t.Fatalf("状态码应为 403（用于诊断日志），got %d", status)
+	}
+	t.Logf("✅ HTTP error (403) handled gracefully, no hang/panic, finalURL=%q status=%d", finalURL, status)
+}
+
+// TestResolveRedirectChain_StrmEndpointError 回归（对齐 MP）：
+// STRM 端点自身返回 5xx（如 115 Cookie 失效 → /api/strm 直接 502）时，
+// resolveRedirectChain 回退原始 STRM URL（而非空串），由调用方 302 给客户端，
+// 保持与 MoviePilot `_resolve_redirect` 一致的降级行为。
+func TestResolveRedirectChain_StrmEndpointError(t *testing.T) {
+	strm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "115 账号 Cookie 已失效，请重新登录", http.StatusBadGateway)
+	}))
+	defer strm.Close()
+
+	emby := mockEmby(t, nil)
+	defer emby.Close()
+
+	proxy, _ := New(emby.URL)
+
+	startURL := strm.URL + "/api/strm?account=a&pickcode=p"
+	req, _ := http.NewRequest("GET", "/Videos/123/stream", nil)
+	finalURL, status := proxy.resolveRedirectChain(context.Background(), startURL, req, "u1")
+	if finalURL != startURL {
+		t.Fatalf("STRM 端点 5xx 时应回退原始 URL %q，got %q", startURL, finalURL)
+	}
+	// 上游状态码需透出，供调用方诊断日志标注（如 502 → 疑似 115 Cookie 失效）
+	if status != http.StatusBadGateway {
+		t.Fatalf("状态码应为 502（用于诊断日志），got %d", status)
+	}
+}
+
+// TestHandleMediaStream_StrmEndpointError 回归（对齐 MP）：
+// 直链解析失败时不再回 502，而是 302 回退原始 STRM URL，由客户端再走一次。
+func TestHandleMediaStream_StrmEndpointError(t *testing.T) {
+	strm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "115 账号 Cookie 已失效，请重新登录", http.StatusBadGateway)
+	}))
+	defer strm.Close()
+	strmURL := strm.URL + "/api/strm?account=a&pickcode=p"
+
+	emby := mockEmby(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildStrmPlaybackInfoResp(strmURL, "src1"))
+	})
+	defer emby.Close()
+
+	proxy, _ := New(emby.URL)
+
+	// 先走 PlaybackInfo 填充 STRM 源缓存
+	req1 := httptest.NewRequest("POST", emby.URL+"/Items/123/PlaybackInfo", strings.NewReader("{}"))
+	proxy.Handler().ServeHTTP(httptest.NewRecorder(), req1)
+
+	req2 := httptest.NewRequest("GET", emby.URL+"/Videos/123/stream?Static=true&MediaSourceId=src1", nil)
+	rr := httptest.NewRecorder()
+	proxy.HandleMediaStream(rr, req2)
+
+	if rr.Code != http.StatusFound {
+		t.Fatalf("解析失败应 302 回退原始 URL，got %d (body=%s)", rr.Code, rr.Body.String())
+	}
+	if loc := rr.Header().Get("Location"); loc != strmURL {
+		t.Errorf("Location 应为原始 STRM URL %q，got %q", strmURL, loc)
+	}
 }
 
 // TestHandleMediaStream_POSTMethod POST 请求 stream 也能正确拦截
@@ -1428,15 +1494,19 @@ func TestExtractAPIKey(t *testing.T) {
 		name string
 		auth string
 		tok  string
+		url  string
 		want string
 	}{
-		{"X-Emby-Token优先", "", "abc123", "abc123"},
-		{"Authorization带引号", `MediaBrowser Token="key-123"`, "", "key-123"},
-		{"Authorization无引号", `MediaBrowser Token=key-456`, "", "key-456"},
-		{"空缺省", "", "", ""},
+		{"X-Emby-Token优先", "", "abc123", "http://x/", "abc123"},
+		{"Authorization带引号", `MediaBrowser Token="key-123"`, "", "http://x/", "key-123"},
+		{"Authorization无引号", `MediaBrowser Token=key-456`, "", "http://x/", "key-456"},
+		{"查询参数X-Emby-Token", "", "", "http://x/users/u/items/1?X-Emby-Token=qry-789", "qry-789"},
+		{"查询参数api_key", "", "", "http://x/emby/videos/1/stream.mkv?api_key=qk-321", "qk-321"},
+		{"请求头优先于查询参数", "", "hdr-1", "http://x/items/1?X-Emby-Token=qry-2", "hdr-1"},
+		{"空缺省", "", "", "http://x/", ""},
 	}
 	for _, c := range cases {
-		req := httptest.NewRequest("GET", "http://x/", nil)
+		req := httptest.NewRequest("GET", c.url, nil)
 		if c.tok != "" {
 			req.Header.Set("X-Emby-Token", c.tok)
 		}
