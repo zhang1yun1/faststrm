@@ -3,6 +3,7 @@ package embyproxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1031,6 +1032,16 @@ func TestHandler_OnlyInterceptStaticStreams(t *testing.T) {
 		t.Logf("✅ Static=true stream intercepted → %s", rr.Header().Get("Location"))
 	})
 
+	t.Run("Static=true + /emby/ 前缀 → 反代拦截并 302（回归）", func(t *testing.T) {
+		req := httptest.NewRequest("GET", emby.URL+"/emby/Videos/123/stream?Static=true&MediaSourceId=src1", nil)
+		rr := httptest.NewRecorder()
+		proxy.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302 (intercepted with /emby prefix)", rr.Code)
+		}
+		t.Logf("✅ /emby/ 前缀 stream intercepted → %s", rr.Header().Get("Location"))
+	})
+
 	t.Run("Static=false → 透传给 Emby（转码路径不被劫持）", func(t *testing.T) {
 		req := httptest.NewRequest("GET", emby.URL+"/Videos/123/stream?MediaSourceId=src1&transcoding=true", nil)
 		rr := httptest.NewRecorder()
@@ -1310,7 +1321,7 @@ func TestResolveFileNameFromStrmURL(t *testing.T) {
 	t.Logf("✅ resolveFileNameFromStrmURL 矩阵通过")
 }
 
-// 修复1 验收：STRM URL 的 .iso 能被解析出扩展名 → isSeekRequiredFormat=true
+// 修复1 验收：STRM URL 的扩展名 / Emby Container 字段都能触发 seek 判定，覆盖 ISO/TS/M2TS
 func TestIsSeekRequiredFormat_StrmURL(t *testing.T) {
 	strmURL := "http://host/原盘/movie.iso"
 	name := resolveFileNameFromStrmURL(strmURL)
@@ -1323,7 +1334,39 @@ func TestIsSeekRequiredFormat_StrmURL(t *testing.T) {
 	if isSeekRequiredFormat("", "") {
 		t.Error("空 name 不应识别为 seek 格式")
 	}
-	t.Logf("✅ 修复1：ISO seek 判断来源验证通过")
+
+	// 文件名扩展名来源：ISO/TS/M2TS 需 seek，普通容器不需要
+	byName := []struct {
+		name string
+		want bool
+	}{
+		{"movie.iso", true},
+		{"movie.ts", true},
+		{"movie.m2ts", true},
+		{"movie.mkv", false},
+	}
+	for _, c := range byName {
+		if got := isSeekRequiredFormat("", c.name); got != c.want {
+			t.Errorf("isSeekRequiredFormat(name=%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// Emby Container 字段来源：iso/ts/m2ts
+	byContainer := []struct {
+		container string
+		want      bool
+	}{
+		{"iso", true},
+		{"ts", true},
+		{"m2ts", true},
+		{"mkv", false},
+	}
+	for _, c := range byContainer {
+		if got := isSeekRequiredFormat(c.container, ""); got != c.want {
+			t.Errorf("isSeekRequiredFormat(container=%q) = %v, want %v", c.container, got, c.want)
+		}
+	}
+	t.Logf("✅ 修复1：ISO/TS/M2TS seek 判断来源验证通过")
 }
 
 // ================================================================
@@ -1487,6 +1530,41 @@ func TestMatchMediaRoute(t *testing.T) {
 		}
 	}
 	t.Logf("✅ matchMediaRoute 矩阵通过")
+}
+
+// TestIsStaticDirectStream 覆盖 /emby/ 前缀与容器后缀场景：
+// 客户端（Emby Web）会把改写的 DirectStreamUrl 拼成 /emby/videos/{id}/stream，
+// 必须被拦截，否则请求静默透传给 Emby Server → ffmpeg 拉流 → 「无兼容的流」。
+func TestIsStaticDirectStream(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/videos/123/stream?Static=true", true},
+		{"/Videos/123/Stream?Static=true", true},
+		{"/emby/videos/123/stream?Static=true", true},
+		{"/emby/Videos/123/stream?Static=true&MediaSourceId=src1", true},
+		{"/emby/audio/456/stream?Static=true", true},
+		{"/emby/videos/123/stream.mkv?Static=true", true},
+		{"/emby/videos/123/stream.iso?Static=true", true},  // ISO 原盘
+		{"/emby/videos/123/stream.ts?Static=true", true},   // TS
+		{"/emby/videos/123/stream.m2ts?Static=true", true}, // M2TS
+		// 生产环境真实复现 URL（外部播放器/Web 播放器均为此形态）
+		{"http://192.168.50.250:8097/emby/videos/168357/stream.mkv?Static=true&MediaSourceId=mediasource_168357&api_key=c6fb64e19ec7479db5b3dcdc15ae90bd", true},
+		{"/emby/videos/123/stream?Static=false", false},
+		{"/emby/videos/123/stream", false},                  // 无 Static
+		{"/emby/videos/123/master.m3u8?Static=true", false}, // HLS 转码
+		{"/emby/videos/123/movie.mkv?Static=true", false},   // 由 matchMediaRoute 管辖
+		{"/emby/items/789/download?Static=true", false},     // 非 stream 路径
+		{"/videos/123/stream/extra?Static=true", false},     // 多余层级
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest("GET", c.path, nil)
+		if got := isStaticDirectStream(req.URL.Path, req); got != c.want {
+			t.Errorf("isStaticDirectStream(%q) = %v, want %v", c.path, got, c.want)
+		}
+	}
+	t.Logf("✅ isStaticDirectStream 矩阵通过")
 }
 
 func TestExtractAPIKey(t *testing.T) {
@@ -1778,5 +1856,383 @@ func TestISOPlayback_EndToEnd(t *testing.T) {
 		}
 	})
 
+	// 5. 生产真实形态回归：/emby 前缀 + 裸 /stream（无扩展名）+ Static=true
+	// Emby Web / 原生播放器用的是 forceDirectPlay 注入的 DirectStreamUrl：
+	// /videos/{id}/stream?Static=true（不带扩展名），客户端 API 基址含 /emby，会拼成
+	// /emby/videos/{id}/stream。修复前该路径既不匹配 isStaticDirectStream（缺 /emby 支持），
+	// 又被 matchMediaRoute 主动跳过（裸 /stream 后缀），于是被静默透传给 Emby Server，
+	// 由其 ffmpeg 拉流失败，表现为 8097 端口「无法兼容的流」。
+	// 注意：必须用裸 /stream；带扩展名（如 /stream.iso）会被 matchMediaRoute 命中，无法复现。
+	t.Run("emby_prefix_bare_stream_route", func(t *testing.T) {
+		for _, ext := range []string{"iso", "ts", "m2ts"} {
+			ext := ext
+			t.Run(ext, func(t *testing.T) {
+				src := isoSrc.URL + "/原盘/阿凡达." + ext
+				sid := "src-" + ext
+				eb := mockEmby(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write(buildStrmPlaybackInfoResp(src, sid))
+				})
+				defer eb.Close()
+
+				px, _ := New(eb.URL)
+
+				piReq := httptest.NewRequest("POST", eb.URL+"/Items/777/PlaybackInfo", strings.NewReader("{}"))
+				piRR := httptest.NewRecorder()
+				px.Handler().ServeHTTP(piRR, piReq)
+				if piRR.Code != http.StatusOK {
+					t.Fatalf("PlaybackInfo 应 200，got %d", piRR.Code)
+				}
+
+				streamURL := eb.URL + "/emby/videos/777/stream?Static=true&MediaSourceId=" + sid
+				req := httptest.NewRequest("GET", streamURL, nil)
+				rr := httptest.NewRecorder()
+				px.Handler().ServeHTTP(rr, req)
+
+				if rr.Code != http.StatusOK {
+					t.Fatalf("[%s] /emby 裸 stream 应走 seek 代理流 200（修复前会透传 Emby 而失败），got %d", ext, rr.Code)
+				}
+				if rr.Body.String() != string(content) {
+					t.Errorf("[%s] 代理流内容应等于 STRM 源（修复前透传 Emby 会拿到 PlaybackInfo JSON），got %q", ext, rr.Body.String())
+				}
+			})
+		}
+	})
+
 	t.Logf("✅ ISO 播放链路端到端验证通过：ISO 走 seek 代理流(200/206)且 Range 透传，mkv 仍走 302")
+}
+
+// ================================================================
+// 上游告警收敛：客户端取消过滤 + 重复抑制
+// ================================================================
+
+// isClientGone 只应把「客户端主动断开」判为真，真实上游故障不受影响
+func TestIsClientGone(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"canceled", context.Canceled, true},
+		{"wrapped_canceled", fmt.Errorf("proxy: %w", context.Canceled), true},
+		{"net_closed", net.ErrClosed, true},
+		{"deadline", context.DeadlineExceeded, false},
+		{"dial_refused", errors.New("dial tcp 192.168.50.250:8096: connect: connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isClientGone(c.err); got != c.want {
+			t.Errorf("isClientGone(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+	t.Logf("✅ 客户端取消过滤：canceled/net.ErrClosed 判真，上游故障/超时不受影响")
+}
+
+// warnThrottle 窗口内抑制同类告警、跨窗口恢复并报告抑制条数
+func TestWarnThrottle(t *testing.T) {
+	// nil 抑制器：始终放行（防御性，避免调用方未初始化时静默丢日志）
+	var nilThrottle *warnThrottle
+	if emit, _ := nilThrottle.allow("k"); !emit {
+		t.Error("nil 抑制器应始终放行")
+	}
+
+	th := newWarnThrottle(time.Minute)
+	if emit, dropped := th.allow("a"); !emit || dropped != 0 {
+		t.Errorf("首次应放行且无抑制，got emit=%v dropped=%d", emit, dropped)
+	}
+	for i := 0; i < 3; i++ {
+		if emit, _ := th.allow("a"); emit {
+			t.Error("窗口内重复告警应被抑制")
+		}
+	}
+	if emit, _ := th.allow("b"); !emit {
+		t.Error("不同 key 不应被相互抑制")
+	}
+
+	// 把 a 的最近放行时间拨到窗口之外 → 再次放行并报告累计的 3 条
+	th.mu.Lock()
+	th.seen["a"].last = time.Now().Add(-2 * time.Minute)
+	th.mu.Unlock()
+	if emit, dropped := th.allow("a"); !emit || dropped != 3 {
+		t.Errorf("跨窗口应放行且报告抑制 3 条，got emit=%v dropped=%d", emit, dropped)
+	}
+
+	// window<=0：不抑制
+	th0 := newWarnThrottle(0)
+	th0.allow("x")
+	if emit, _ := th0.allow("x"); !emit {
+		t.Error("window=0 时不应抑制")
+	}
+
+	// key 数超上限时重置，避免无界增长
+	thc := newWarnThrottle(time.Minute)
+	for i := 0; i < upstreamWarnMaxKeys+5; i++ {
+		thc.allow("k" + strconv.Itoa(i))
+	}
+	thc.mu.Lock()
+	n := len(thc.seen)
+	thc.mu.Unlock()
+	if n > upstreamWarnMaxKeys {
+		t.Errorf("key 数应受上限约束，got %d", n)
+	}
+	t.Logf("✅ 上游告警抑制：窗口内去重、跨窗口报告抑制条数、key 数受上限约束")
+}
+
+// ================================================================
+// 上游请求/响应头收敛（A1/A2/A3）
+// ================================================================
+
+func TestStripConditionalRequestHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("If-Modified-Since", "Mon, 02 Jan 2006 15:04:05 GMT")
+	h.Set("If-None-Match", `"v1"`)
+	h.Set("If-Range", `"v1"`)
+	h.Set("Authorization", "Bearer x")
+
+	stripConditionalRequestHeaders(h)
+
+	for _, k := range []string{"If-Modified-Since", "If-None-Match", "If-Range"} {
+		if got := h.Get(k); got != "" {
+			t.Errorf("%s 应被剥离，got %q", k, got)
+		}
+	}
+	if h.Get("Authorization") == "" {
+		t.Error("无关请求头不应被误删")
+	}
+	t.Logf("✅ 条件请求头剥离：命中项删除、其他头保留")
+}
+
+func TestStripBodyValidators(t *testing.T) {
+	h := http.Header{}
+	h.Set("Content-MD5", "Q2hlY2sgSW50ZWdyaXR5IQ==")
+	h.Set("ETag", `"v1"`)
+	h.Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+	h.Set("Content-Type", "text/html")
+
+	stripBodyValidators(h)
+
+	for _, k := range []string{"Content-MD5", "ETag", "Last-Modified"} {
+		if got := h.Get(k); got != "" {
+			t.Errorf("%s 应被剥离，got %q", k, got)
+		}
+	}
+	if h.Get("Content-Type") == "" {
+		t.Error("无关响应头不应被误删")
+	}
+	t.Logf("✅ 正文校验头剥离：Content-MD5/ETag/Last-Modified 删除、其他头保留")
+}
+
+func TestNewUpstreamTransport_NoEnvProxy(t *testing.T) {
+	tr := newUpstreamTransport()
+	if tr == nil {
+		t.Fatal("transport 不应为 nil")
+	}
+	if tr.Proxy != nil {
+		t.Error("上游 transport 必须显式关闭环境变量代理（Proxy=nil）")
+	}
+	if !tr.ForceAttemptHTTP2 {
+		t.Error("应保留 DefaultTransport 默认（ForceAttemptHTTP2=true）")
+	}
+	if newUpstreamTransport() == tr {
+		t.Error("每次应返回独立 transport，避免 client 间共享可变状态")
+	}
+	t.Logf("✅ 上游 transport：直连（Proxy=nil）、保留默认、实例独立")
+}
+
+func TestServePatchedJS_StripsValidatorsAndConditionalHeaders(t *testing.T) {
+	var gotIfNoneMatch, gotIfModifiedSince string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotIfNoneMatch = r.Header.Get("If-None-Match")
+		gotIfModifiedSince = r.Header.Get("If-Modified-Since")
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("ETag", `"js-v1"`)
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Content-MD5", "Q2hlY2sgSW50ZWdyaXR5IQ==")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`var a = foo.IsRemote && "DirectPlay" === foo ? null : "anonymous";`))
+	}))
+	defer upstream.Close()
+
+	p, err := New(upstream.URL)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.web/web/modules/htmlvideoplayer/basehtmlplayer.js", nil)
+	req.Header.Set("If-None-Match", `"js-v1"`)
+	req.Header.Set("If-Modified-Since", "Mon, 02 Jan 2006 15:04:05 GMT")
+	rr := httptest.NewRecorder()
+	p.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if gotIfNoneMatch != "" || gotIfModifiedSince != "" {
+		t.Errorf("转发时应剥离条件请求头，upstream 仍收到 If-None-Match=%q If-Modified-Since=%q",
+			gotIfNoneMatch, gotIfModifiedSince)
+	}
+	for _, k := range []string{"ETag", "Last-Modified", "Content-MD5"} {
+		if v := rr.Header().Get(k); v != "" {
+			t.Errorf("JS 正文改写后应剥离校验头 %s，got %q", k, v)
+		}
+	}
+	if strings.Contains(rr.Body.String(), `"anonymous"`) {
+		t.Errorf("JS 应被修补（去掉 anonymous），got: %s", rr.Body.String())
+	}
+	t.Logf("✅ servePatchedJS：条件头不进上游、校验头不出响应、正文已修补")
+}
+
+func TestServeHTMLInjected_StripsBodyValidators(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("ETag", `"html-v1"`)
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("Content-MD5", "Q2hlY2sgSW50ZWdyaXR5IQ==")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<html><head></head><body>Emby</body></html>"))
+	}))
+	defer upstream.Close()
+
+	p, err := New(upstream.URL)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://proxy.web/web/index.html", nil)
+	rr := httptest.NewRecorder()
+	p.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), crossOriginInterceptMarker) {
+		t.Fatalf("应注入 crossOrigin 脚本，got: %s", rr.Body.String())
+	}
+	for _, k := range []string{"ETag", "Last-Modified", "Content-MD5"} {
+		if v := rr.Header().Get(k); v != "" {
+			t.Errorf("HTML 正文改写后应剥离校验头 %s，got %q", k, v)
+		}
+	}
+	t.Logf("✅ serveHTMLInjected：注入生效且校验头（含 Content-MD5）已剥离")
+}
+
+// ================================================================
+// 反代优化 O1/O2：媒体 302 缓存有效期提示 + 全局 Referrer-Policy
+// ================================================================
+
+// mediaRedirectCacheControl：带签名 t 参数时按剩余有效期封顶，无法解析签名则不缓存
+func TestMediaRedirectCacheControl(t *testing.T) {
+	longFuture := time.Now().Add(10 * time.Minute).Unix()
+	past := time.Now().Add(-1 * time.Minute).Unix()
+
+	cases := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"无t参数→no-store", "https://cdn.115.com/x.mkv", "no-store"},
+		{"t非法→no-store", "https://cdn.115.com/x.mkv?t=abc", "no-store"},
+		{"t已过期→no-store", fmt.Sprintf("https://cdn.115.com/x.mkv?t=%d", past), "no-store"},
+		{"URL解析失败→no-store", "http://[::1", "no-store"},
+		{"t远期→封顶playbackURLCacheTTL", fmt.Sprintf("https://cdn.115.com/x.mkv?t=%d", longFuture), "private, max-age=90"},
+	}
+	for _, c := range cases {
+		if got := mediaRedirectCacheControl(c.url); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// t 剩余约 30s（< 90s）→ max-age 取剩余时长
+	got := mediaRedirectCacheControl(fmt.Sprintf("https://cdn.115.com/x.mkv?t=%d", time.Now().Add(30*time.Second).Unix()))
+	var n int
+	if _, err := fmt.Sscanf(got, "private, max-age=%d", &n); err != nil {
+		t.Fatalf("t 有效时应为 private, max-age=N，got %q (%v)", got, err)
+	}
+	if n < 27 || n > 30 {
+		t.Errorf("max-age 应≈30（剩余签名有效期），got %d", n)
+	}
+	t.Logf("✅ mediaRedirectCacheControl 矩阵通过（有效t→private, max-age=剩余；其余→no-store）")
+}
+
+// 媒体 302（缓存命中 + 解析后）都应下发 Cache-Control
+func TestHandleMediaStream_302SetsCacheControl(t *testing.T) {
+	strmSrc := mockStrmSrc(t, "")
+	defer strmSrc.Close()
+	strmURL := strmSrc.URL + "/video.mkv"
+	body := buildStrmPlaybackInfoResp(strmURL, "src1")
+
+	emby := mockEmby(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	defer emby.Close()
+
+	proxy, _ := New(emby.URL)
+
+	piReq := httptest.NewRequest("POST", emby.URL+"/Items/123/PlaybackInfo", strings.NewReader("{}"))
+	proxy.Handler().ServeHTTP(httptest.NewRecorder(), piReq)
+
+	// 首次：解析重定向链后 302
+	rr := httptest.NewRecorder()
+	proxy.HandleMediaStream(rr, httptest.NewRequest("GET", emby.URL+"/Videos/123/stream?Static=true&MediaSourceId=src1", nil))
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", rr.Code)
+	}
+	// mockStrmSrc 直链无签名 t 参数 → no-store（避免缓存短时直链）
+	if cc := rr.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("无签名 t 参数的直链 302 应 no-store，got %q", cc)
+	}
+
+	// 第二次：缓存命中 302，同样应带 Cache-Control
+	rr2 := httptest.NewRecorder()
+	proxy.HandleMediaStream(rr2, httptest.NewRequest("GET", emby.URL+"/Videos/123/stream?Static=true&MediaSourceId=src1", nil))
+	if rr2.Code != http.StatusFound {
+		t.Fatalf("cache hit status = %d, want 302", rr2.Code)
+	}
+	if cc := rr2.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("缓存命中的 302 也应带 Cache-Control，got %q", cc)
+	}
+	t.Logf("✅ 媒体 302 均下发 Cache-Control（解析后 + 缓存命中）")
+}
+
+// 全局 Referrer-Policy: no-referrer（302 与 HTML 透传分支均生效）
+func TestHandler_SetsReferrerPolicy(t *testing.T) {
+	strmSrc := mockStrmSrc(t, "")
+	defer strmSrc.Close()
+	strmURL := strmSrc.URL + "/video.mkv"
+	body := buildStrmPlaybackInfoResp(strmURL, "src1")
+
+	emby := mockEmby(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	defer emby.Close()
+
+	proxy, _ := New(emby.URL)
+
+	t.Run("media_302", func(t *testing.T) {
+		piReq := httptest.NewRequest("POST", emby.URL+"/Items/123/PlaybackInfo", strings.NewReader("{}"))
+		proxy.Handler().ServeHTTP(httptest.NewRecorder(), piReq)
+
+		rr := httptest.NewRecorder()
+		proxy.Handler().ServeHTTP(rr, httptest.NewRequest("GET", emby.URL+"/Videos/123/stream?Static=true&MediaSourceId=src1", nil))
+		if rr.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302", rr.Code)
+		}
+		if got := rr.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("302 响应应带 Referrer-Policy: no-referrer，got %q", got)
+		}
+	})
+
+	t.Run("html_passthrough", func(t *testing.T) {
+		rr := httptest.NewRecorder()
+		proxy.Handler().ServeHTTP(rr, httptest.NewRequest("GET", emby.URL+"/web/index.html", nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rr.Code)
+		}
+		if got := rr.Header().Get("Referrer-Policy"); got != "no-referrer" {
+			t.Errorf("HTML 透传响应应带 Referrer-Policy: no-referrer，got %q", got)
+		}
+	})
+	t.Logf("✅ 全局 Referrer-Policy: no-referrer（302 与 HTML 分支均生效）")
 }

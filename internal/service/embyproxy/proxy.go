@@ -17,8 +17,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -286,7 +288,8 @@ func New(embyHost string, forceProxyUaTokens ...[]string) (*Proxy, error) {
 
 	// Client A: 用于 Emby 反向代理透传，不跟随重定向
 	proxyHTTPClient := &http.Client{
-		Timeout: 120 * time.Second,
+		Timeout:   120 * time.Second,
+		Transport: newUpstreamTransport(),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // 不跟随重定向，让客户端自己 302
 		},
@@ -295,7 +298,8 @@ func New(embyHost string, forceProxyUaTokens ...[]string) (*Proxy, error) {
 	// Client B: 用于解析重定向链拿最终 CDN URL
 	// 对齐 MoviePilot httpx.AsyncClient(follow_redirects=True)
 	followClient := &http.Client{
-		Timeout: 30 * time.Second, // 单次超时由 resolveRedirectChain 自己控制
+		Timeout:   30 * time.Second, // 单次超时由 resolveRedirectChain 自己控制
+		Transport: newUpstreamTransport(),
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects: %d", len(via))
@@ -314,7 +318,7 @@ func New(embyHost string, forceProxyUaTokens ...[]string) (*Proxy, error) {
 			IdleConnTimeout:       90 * time.Second,
 			ResponseHeaderTimeout: 0,
 			DisableCompression:    true,
-			Proxy:                 http.ProxyFromEnvironment,
+			Proxy:                 nil, // 直连上游，避免环境变量代理误伤内网 Emby
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -346,6 +350,117 @@ func (p *Proxy) SetProxyPort(port int) {
 }
 
 // ============================================================
+// 上游告警：客户端取消过滤 + 重复抑制
+// 上游 Emby 停机时客户端（Emby Web 仪表盘）会高频轮询，若每条都打 WARN 会刷屏，
+// 且把「客户端主动断开」误报为代理失败，淹没真正的故障。此处统一收敛。
+// ============================================================
+
+// upstreamWarnWindow 同一上游故障告警的最小重复间隔。
+const upstreamWarnWindow = 30 * time.Second
+
+// upstreamWarnMaxKeys 抑制器 key 数上限，防止异常路径撑爆 map。
+const upstreamWarnMaxKeys = 256
+
+// upstreamWarn 全局上游告警抑制器。
+var upstreamWarn = newWarnThrottle(upstreamWarnWindow)
+
+// isClientGone 判断错误是否由「客户端主动断开」引起（切页/刷新/取消），
+// 而非上游 Emby 故障。此类错误不应记为 WARN。
+func isClientGone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed)
+}
+
+// warnUpstream 记录一次上游失败告警：客户端取消不打印，同一 key 的重复告警按窗口抑制。
+func warnUpstream(key, msg string) {
+	if emit, dropped := upstreamWarn.allow(key); emit {
+		if dropped > 0 {
+			logger.S().Warnf("%s（同类告警已抑制 %d 条）", msg, dropped)
+			return
+		}
+		logger.S().Warnf("%s", msg)
+	}
+}
+
+// warnThrottle 对相同 key 的告警做窗口抑制：窗口内只放行第一条，其余累计；
+// 下一次放行时一并报告被抑制的条数。
+type warnThrottle struct {
+	mu     sync.Mutex
+	window time.Duration
+	seen   map[string]*throttleState
+}
+
+type throttleState struct {
+	last    time.Time
+	dropped int
+}
+
+func newWarnThrottle(window time.Duration) *warnThrottle {
+	return &warnThrottle{window: window, seen: make(map[string]*throttleState)}
+}
+
+// allow 返回本次是否放行打印，以及自上次放行以来被抑制的条数。
+func (t *warnThrottle) allow(key string) (emit bool, dropped int) {
+	if t == nil {
+		return true, 0
+	}
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.seen[key]
+	if st == nil {
+		if len(t.seen) >= upstreamWarnMaxKeys {
+			t.seen = make(map[string]*throttleState)
+		}
+		t.seen[key] = &throttleState{last: now}
+		return true, 0
+	}
+	if now.Sub(st.last) < t.window {
+		st.dropped++
+		return false, 0
+	}
+	dropped = st.dropped
+	st.dropped = 0
+	st.last = now
+	return true, dropped
+}
+
+// ============================================================
+// 上游请求/响应头收敛
+// ============================================================
+
+// newUpstreamTransport 返回直连上游 Emby 的 transport。
+// 显式关闭环境变量代理：若部署机设置了 HTTP_PROXY/HTTPS_PROXY，内网 Emby（如 192.168.x.x）
+// 会被错误地走代理，导致反代 502。对齐 MoviePilot / QMediaSync 显式控制代理的做法。
+func newUpstreamTransport() *http.Transport {
+	var t *http.Transport
+	if def, ok := http.DefaultTransport.(*http.Transport); ok {
+		t = def.Clone()
+	} else {
+		t = &http.Transport{}
+	}
+	t.Proxy = nil
+	return t
+}
+
+// stripConditionalRequestHeaders 剥离条件请求头。
+// 转发 JS/HTML 时若带上 If-Modified-Since / If-None-Match，上游可能直接返回 304，
+// 我们将拿不到正文，crossOrigin 注入 / JS 补丁随之失效。
+func stripConditionalRequestHeaders(h http.Header) {
+	h.Del("If-Modified-Since")
+	h.Del("If-None-Match")
+	h.Del("If-Range")
+}
+
+// stripBodyValidators 剥离正文校验头。
+// 一旦我们改写了响应正文（注入脚本 / 打补丁），原 ETag/Last-Modified/Content-MD5 即失效，
+// 若继续下发，中间缓存可能命中旧版本，导致补丁不生效。
+func stripBodyValidators(h http.Header) {
+	h.Del("Content-MD5")
+	h.Del("ETag")
+	h.Del("Last-Modified")
+}
+
+// ============================================================
 // Handler — 返回反代 HTTP handler
 // ============================================================
 
@@ -361,6 +476,7 @@ func (p *Proxy) Handler() http.Handler {
 		})
 	}
 	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.Transport = newUpstreamTransport()
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
@@ -373,7 +489,9 @@ func (p *Proxy) Handler() http.Handler {
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		logger.S().Warnf("[EmbyProxy] 代理失败 %s %s: %v", r.Method, r.URL.Path, err)
+		if !isClientGone(err) {
+			warnUpstream(r.Method+" "+r.URL.Path, fmt.Sprintf("[EmbyProxy] 代理失败 %s %s: %v", r.Method, r.URL.Path, err))
+		}
 		http.Error(w, fmt.Sprintf("Emby Proxy Error: %v", err), http.StatusBadGateway)
 	}
 
@@ -381,6 +499,11 @@ func (p *Proxy) Handler() http.Handler {
 	// 分发顺序：WS 升级 → system/info 端口改写 → 外部播放器唤起 → JS 修补（crossOrigin）
 	//          → 媒体流拦截 → 详情页 ExternalUrls 注入 → HTML 注入 → 透传
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 全局收敛 Referrer：Emby Web/播放器向 115 等 CDN 拉流时不应携带反代地址，
+		// 既避免泄露内网地址，也避免被 CDN 作为来源校验拒绝。
+		// 对齐 QMediaSync referrerPolicySetter（Referrer-Policy: no-referrer）。
+		w.Header().Set("Referrer-Policy", "no-referrer")
+
 		path := r.URL.Path
 
 		// 0. WebSocket 升级请求：透明双向转发（Emby 实时通知/进度同步/远程控制依赖此链路）
@@ -788,6 +911,8 @@ func (p *Proxy) serveHTMLInjected(w http.ResponseWriter, r *http.Request) {
 	req.Header.Del("Host")
 	// 去掉 Accept-Encoding，确保上游返回未压缩内容以便修改 body
 	req.Header.Del("Accept-Encoding")
+	// 去掉条件请求头，避免上游返回 304 导致拿不到正文、无法注入
+	stripConditionalRequestHeaders(req.Header)
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
@@ -829,8 +954,7 @@ func (p *Proxy) serveHTMLInjected(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
-		w.Header().Del("ETag")
-		w.Header().Del("Last-Modified")
+		stripBodyValidators(w.Header())
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
@@ -850,6 +974,8 @@ func (p *Proxy) servePatchedJS(w http.ResponseWriter, r *http.Request) {
 	req.Header = r.Header.Clone()
 	req.Header.Del("Host")
 	req.Header.Del("Accept-Encoding")
+	// 去掉条件请求头，避免上游返回 304 导致拿不到正文、无法打补丁
+	stripConditionalRequestHeaders(req.Header)
 
 	resp, err := p.followRedirectClient.Do(req)
 	if err != nil {
@@ -899,6 +1025,7 @@ func (p *Proxy) servePatchedJS(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
+		stripBodyValidators(w.Header())
 		logger.S().Infof("[EmbyProxy] 已修补 JS: path=%s", r.URL.Path)
 	}
 	w.WriteHeader(http.StatusOK)
@@ -983,6 +1110,38 @@ func (p *Proxy) proxyStreamToStrm(w http.ResponseWriter, r *http.Request, strmUR
 }
 
 // ============================================================
+// 媒体 302 缓存有效期提示
+// ============================================================
+
+// mediaRedirectCacheControl 生成媒体 302 的 Cache-Control。
+// 反代下发的最终直链多为带签名的短时 URL（如 115 的 t 参数）：若客户端/中间缓存
+// 把这次 302 缓存过久，签名过期后起播必然失败。因此把可缓存时长收敛为
+// 「min(反代缓存 TTL, CDN 签名剩余有效期)」；无法解析签名时直接 no-store（不缓存）。
+// 对齐 QMediaSync redirectCacheExpiresAt「以签名到期为准」的策略。
+func mediaRedirectCacheControl(finalURL string) string {
+	parsed, err := url.Parse(finalURL)
+	if err != nil {
+		return "no-store"
+	}
+	tStr := parsed.Query().Get("t")
+	if tStr == "" {
+		return "no-store"
+	}
+	t, err := strconv.ParseInt(tStr, 10, 64)
+	if err != nil {
+		return "no-store"
+	}
+	remain := time.Until(time.Unix(t, 0))
+	if remain <= 0 {
+		return "no-store"
+	}
+	if remain > playbackURLCacheTTL {
+		remain = playbackURLCacheTTL
+	}
+	return fmt.Sprintf("private, max-age=%d", int(remain.Seconds()))
+}
+
+// ============================================================
 // HandleMediaStream — 核心媒体流路由
 // ============================================================
 
@@ -1009,6 +1168,7 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// 1a. playbackURLCache — 已解析的最终 CDN URL（命中率最高）
 	if finalURL, ok := p.getCachedPlaybackURL(cacheKey); ok {
 		logger.S().Debugf("[EmbyProxy] playbackURLCache 命中: item=%s source=%s -> %s", itemID, sourceID, finalURL)
+		w.Header().Set("Cache-Control", mediaRedirectCacheControl(finalURL))
 		w.Header().Set("Location", finalURL)
 		w.WriteHeader(http.StatusFound)
 		return
@@ -1075,6 +1235,7 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 	p.cachePlaybackURL(cacheKey, finalURL)
 
 	logger.S().Infof("[EmbyProxy] media 302: item=%s source=%s -> %s", itemID, sourceID, finalURL)
+	w.Header().Set("Cache-Control", mediaRedirectCacheControl(finalURL))
 	w.Header().Set("Location", finalURL)
 	w.WriteHeader(http.StatusFound)
 }
@@ -1478,10 +1639,17 @@ func (p *Proxy) fetchPlaybackInfoFallback(ctx context.Context, r *http.Request, 
 	return strmSourceMeta{}
 }
 
+// staticDirectStreamRE 匹配反代自己生成的直链流请求 /videos/{id}/stream、/audio/{id}/stream。
+// 与 mediaRoutePatterns 保持一致，兼容客户端带上的可选 /emby/ 前缀：
+// Emby Web 的 API 基址含 /emby，会把改写的 DirectStreamUrl 拼成
+// /emby/videos/{id}/stream，若不识别则该请求会静默透传给 Emby Server，
+// 由其 ffmpeg 拉流（UA=Lavf）失败，表现为「无兼容的流」。
+// 同时容忍可选的容器后缀（/stream.mkv 等别名）。
+var staticDirectStreamRE = regexp.MustCompile(`^/(?:emby/)?(?:videos|audio)/[^/]+/stream(?:\.[a-z0-9]+)?$`)
+
 // isStaticDirectStream 判断是否为反代自己生成的直链流请求（/videos/ 或 /audio/ 且 Static=true）
 func isStaticDirectStream(path string, r *http.Request) bool {
-	lower := strings.ToLower(path)
-	if !strings.HasPrefix(lower, "/videos/") && !strings.HasPrefix(lower, "/audio/") {
+	if !staticDirectStreamRE.MatchString(strings.ToLower(path)) {
 		return false
 	}
 	return strings.EqualFold(r.URL.Query().Get("Static"), "true")
