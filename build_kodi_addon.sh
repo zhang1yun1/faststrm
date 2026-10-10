@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# FastStrm Kodi (CoreELEC / Linux ARM64 & ARMv7 & AMD64) 插件一键构建脚本
-# 作用: 交叉编译 Go 二进制、生成 Kodi 插件文件 (addon.xml, service.py 等) 并打包为 ZIP
+# FastStrm Kodi (CoreELEC / Linux ARM64) 插件一键构建脚本
+# 作用: 交叉编译 Go 单二进制、生成 Kodi 插件文件 (addon.xml, service.py 等) 并打包为 ZIP
+# 用法: ./build_kodi_addon.sh [arm64|armv7|amd64|all|<预编译二进制路径>]
+#   - 默认 arm64 (CoreELEC 主流平台)
 # ==============================================================================
 
 set -e
@@ -13,8 +15,8 @@ DIST_DIR="${ROOT_DIR}/dist"
 ADDON_ID="service.faststrm"
 ADDON_DIR="${BUILD_DIR}/${ADDON_ID}"
 
-# 主程序版本信息（自动从 cmd/server/main.go 中提取）
-APP_VERSION="v1.3.1"
+# 主程序版本信息 (自动从 cmd/server/main.go 中提取)
+APP_VERSION="v1.4.1"
 if [ -f "${ROOT_DIR}/cmd/server/main.go" ]; then
     EXTRACTED_VER=$(grep -E '^[[:space:]]*version[[:space:]]*=' "${ROOT_DIR}/cmd/server/main.go" | cut -d '"' -f 2)
     if [ -n "${EXTRACTED_VER}" ]; then
@@ -22,7 +24,7 @@ if [ -f "${ROOT_DIR}/cmd/server/main.go" ]; then
     fi
 fi
 
-# 基础版本号（去除开头的 v，如 v1.3.1 -> 1.3.1）
+# 基础版本号 (去除开头的 v, 如 v1.4.1 -> 1.4.1)
 BASE_KODI_VERSION=$(echo "${APP_VERSION}" | sed 's/^v//' | sed 's/-.*//')
 
 # 插件发布版本号
@@ -52,7 +54,7 @@ compile_go() {
 
     echo " -> 正在交叉编译 ${goos}/${goarch}${goarm:+ (GOARM=${goarm})} 二进制..."
     cd "${ROOT_DIR}"
-    
+
     local BUILD_DATE
     BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     local LDFLAGS="-s -w -X 'main.version=${VERSION}' -X 'main.BuildDate=${BUILD_DATE}'"
@@ -68,7 +70,7 @@ compile_go() {
             return 1
         fi
     fi
-    
+
     chmod +x "${target_path}"
     echo "    编译成功: ${out_name}"
 }
@@ -115,7 +117,7 @@ echo "[3/4] 生成 Kodi 插件清单与交互/守护脚本..."
 # 生成 addon.xml
 cat <<EOF > "${ADDON_DIR}/addon.xml"
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="${ADDON_ID}" name="FastStrm Service" version="${KODI_VERSION}" provider-name="FastStrm">
+<addon id="${ADDON_ID}" name="FastStrm Service" version="${KODI_VERSION}" provider-name="wabisabi926">
   <requires>
     <import addon="xbmc.python" version="3.0.0"/>
   </requires>
@@ -124,10 +126,10 @@ cat <<EOF > "${ADDON_DIR}/addon.xml"
     <provides>executable</provides>
   </extension>
   <extension point="xbmc.addon.metadata">
-    <summary lang="zh_CN">FastStrm 115网盘同步流媒体后台服务</summary>
-    <summary lang="en_GB">FastStrm 115 Cloud Drive Media Stream Service</summary>
-    <description lang="zh_CN">在 CoreELEC / Linux (ARM64 / x86_64) 后台静默运行 FastStrm 守护进程。支持 115 网盘扫码登录、自动生成本地 .strm 媒体库、直连 115 CDN 秒开播放，无需外置 NAS 或电脑。</description>
-    <description lang="en_GB">Run FastStrm daemon service in CoreELEC / Linux environment for seamless 115 cloud streaming.</description>
+    <summary lang="zh_CN">FastStrm 让 115 网盘和你的播放器真正「同步」</summary>
+    <summary lang="en_GB">FastStrm syncs your 115 cloud drive with your player</summary>
+    <description lang="zh_CN">在 CoreELEC / Linux (ARM64 / x86_64) 后台静默运行 FastStrm，让 115 网盘和你的播放器真正「同步」：播放时直连 115 CDN 流式传输，不下载任何东西、4K 秒开、不占硬盘；10 秒感知网盘增删改，新上传自动生成 .strm，删除自动清理；扫码登录零配置，Cookie 过期还能一键刷新；无需外置 NAS 或电脑。</description>
+    <description lang="en_GB">Run FastStrm daemon in CoreELEC / Linux to keep your 115 cloud drive and player in sync: stream directly from the 115 CDN without downloading, auto-generate .strm files within seconds, QR-code login with zero config, no external NAS or PC required.</description>
     <platform>linux</platform>
     <license>MIT</license>
     <assets>
@@ -221,7 +223,7 @@ class FastStrmService(xbmc.Monitor):
 
     def detect_binary(self):
         bin_dir = os.path.join(self.addon_dir, "bin")
-        
+
         single_bin = os.path.join(bin_dir, "faststrm")
         if os.path.exists(single_bin):
             return single_bin

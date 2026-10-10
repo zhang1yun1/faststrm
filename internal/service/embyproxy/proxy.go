@@ -1216,12 +1216,27 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 
 	// ===== 步骤 2: 解析重定向链拿最终 CDN URL =====
 	// 对齐 MoviePilot `_resolve_redirect`：解析失败（超时 / STRM 端点报错）时返回原始
-	// STRM URL，由客户端再走一次 STRM 端点，而不是在代理侧直接报 502。
-	// upstreamStatus 仅用于诊断日志（响应行为不变），MP 本身对 4xx/5xx 是静默的。
+	// STRM URL，由调用方决定后续处理。
+	//
+	// 反代外网场景的关键修复：FastStrm 的 STRM 源统一为 `{prefix}/api/strm?...`，
+	// 其 HEAD 响应固定 200（见 strm.go writeStrmHeadResponse），因此 resolveRedirectChain
+	// 永远走不出重定向链，finalURL 恒等于原始 STRM URL。若沿用旧逻辑 302 回退该 URL，
+	// 反代暴露给外网时，Location 是内网地址（如 http://192.168.31.24:8091/api/strm），
+	// 外网客户端连不上 → 「无兼容的流」。
+	// 故对 FastStrm 自身 /api/strm 端点，解析无重定向时改走 proxyStreamToStrm 代理流：
+	// 客户端连接始终停留在 FastStrm，由服务端拉 STRM→CDN 再回传，外网/内网均能兜底播放。
+	// 对其他可直连的外部源（非 /api/strm），保留原 302 回退行为。
+	// upstreamStatus 仅用于诊断日志。
 	finalURL, upstreamStatus := p.resolveRedirectChain(r.Context(), meta.path, r, userID)
 	if finalURL == meta.path {
+		if isSelfStrmEndpoint(meta.path) {
+			logger.S().Infof("[EmbyProxy] media 直链解析无重定向（FastStrm /api/strm：HEAD 固定 200），改走代理流: item=%s source=%s strm=%s",
+				itemID, sourceID, meta.path)
+			p.proxyStreamToStrm(w, r, meta.path)
+			return
+		}
 		if upstreamStatus >= http.StatusBadRequest {
-			logger.S().Warnf("[EmbyProxy] media 直链解析失败: STRM 端点返回 %d，疑似 115 Cookie 失效/直链过期，302 回退原始 STRM URL: item=%s source=%s strm=%s",
+			logger.S().Warnf("[EmbyProxy] media 直链解析失败: STRM 端点返回 %d，302 回退原始 STRM URL: item=%s source=%s strm=%s",
 				upstreamStatus, itemID, sourceID, meta.path)
 		} else {
 			logger.S().Warnf("[EmbyProxy] media 直链解析未成功（上游无响应/超时），302 回退原始 STRM URL: item=%s source=%s strm=%s",
@@ -1238,6 +1253,19 @@ func (p *Proxy) HandleMediaStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", mediaRedirectCacheControl(finalURL))
 	w.Header().Set("Location", finalURL)
 	w.WriteHeader(http.StatusFound)
+}
+
+// isSelfStrmEndpoint 判断 STRM 源是否为 FastStrm 自身的 /api/strm 端点。
+// FastStrm 所有 STRM 生成器统一硬编码 `{prefix}/api/strm?account=...&pickcode=...`，
+// 该端点 HEAD 固定返回 200（writeStrmHeadResponse），resolveRedirectChain 无法沿
+// 重定向链取到 CDN URL。这种自引用端点暴露给外网时，302 回退到的内网地址客户端连不上，
+// 因此必须改走代理流。其余可直连的外部源走原 302 逻辑。
+func isSelfStrmEndpoint(strmURL string) bool {
+	u, err := url.Parse(strmURL)
+	if err != nil {
+		return false
+	}
+	return u.Path == "/api/strm" || u.Path == "/api/strm/"
 }
 
 // passthroughToEmby 透传媒体流请求到 Emby 真实地址
@@ -1298,10 +1326,26 @@ func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *ht
 		fwdHeaders["X-Emby-UserId"] = userID
 	}
 
+	// FastStrm 自身 /api/strm 端点的 HEAD 默认固定返回 200（见 strm.go writeStrmHeadResponse），
+	// 使解析永远走不出重定向链、取不到 CDN URL。追加内部参数 redirect=1 后，该端点对
+	// 「决策为 Redirect」的 HEAD 会返回真正的 302 CDN URL（见 strm.go HEAD 短路径），
+	// 让普通格式能 302 直连 CDN（对齐 MoviePilot _resolve_redirect）。
+	// headURL 仅在本次解析请求使用，不影响上层 meta.path 的缓存键与兜底比较。
+	headURL := startURL
+	if isSelfStrmEndpoint(startURL) {
+		u, err := url.Parse(startURL)
+		if err == nil {
+			q := u.Query()
+			q.Set("redirect", "1")
+			u.RawQuery = q.Encode()
+			headURL = u.String()
+		}
+	}
+
 	for attempt, to := range redirectResolveTimeouts {
 		reqCtx, cancel := context.WithTimeout(ctx, to.connect+to.read)
 
-		req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, startURL, nil)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, headURL, nil)
 		if err != nil {
 			cancel()
 			logger.S().Warnf("[EmbyProxy] resolveRedirectChain: 构造 HEAD 请求失败，回退原始 URL: %v", err)
@@ -1325,12 +1369,20 @@ func (p *Proxy) resolveRedirectChain(ctx context.Context, startURL string, r *ht
 			return startURL, 0
 		}
 
-		// resp.Request.URL 是跟随所有重定向后的最终 URL；未发生重定向时即 startURL
-		// （例如 STRM 端点自身返回 4xx/5xx，此时 finalURL == startURL，交给客户端再走一次）。
+		// resp.Request.URL 是跟随所有重定向后的最终 URL；未发生重定向时即 headURL
+		// （例如 STRM 端点自身返回 4xx/5xx，此时 finalURL == headURL，交给客户端再走一次）。
 		finalURL := resp.Request.URL.String()
 		status := resp.StatusCode
 		resp.Body.Close()
 		cancel()
+
+		// 对 FastStrm 自身 /api/strm：若最终仍停在 /api/strm 端点（决策为 Proxy 或
+		// 解析失败，未得到 CDN 302），把结果规范化回原始 startURL。这能让上层
+		// `finalURL == meta.path` 的兜底判断保持成立并落到代理流，避免带上 redirect=1
+		// 的中间 URL 破坏缓存键与兜底逻辑。
+		if isSelfStrmEndpoint(startURL) && isSelfStrmEndpoint(finalURL) {
+			finalURL = startURL
+		}
 
 		logger.S().Debugf("[EmbyProxy] resolveRedirectChain: %s -> %s (status=%d attempt=%d)", startURL, finalURL, status, attempt+1)
 		return finalURL, status

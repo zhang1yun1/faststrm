@@ -1135,8 +1135,9 @@ func TestResolveRedirectChain_StrmEndpointError(t *testing.T) {
 	}
 }
 
-// TestHandleMediaStream_StrmEndpointError 回归（对齐 MP）：
-// 直链解析失败时不再回 502，而是 302 回退原始 STRM URL，由客户端再走一次。
+// TestHandleMediaStream_StrmEndpointError 回归：
+// 直链解析失败时不再 302 回退原始 STRM URL（内网地址在外网反代下连不上），
+// 而是改走 proxyStreamToStrm 代理流：中转 STRM 端点并回传其响应码。
 func TestHandleMediaStream_StrmEndpointError(t *testing.T) {
 	strm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "115 账号 Cookie 已失效，请重新登录", http.StatusBadGateway)
@@ -1160,11 +1161,70 @@ func TestHandleMediaStream_StrmEndpointError(t *testing.T) {
 	rr := httptest.NewRecorder()
 	proxy.HandleMediaStream(rr, req2)
 
-	if rr.Code != http.StatusFound {
-		t.Fatalf("解析失败应 302 回退原始 URL，got %d (body=%s)", rr.Code, rr.Body.String())
+	// 不再 302：改为代理流转发 STRM 端点，回传其上游状态码（此处 STRM 返回 502）
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("解析失败应走代理流回传 STRM 端点状态码 %d，got %d (body=%s)",
+			http.StatusBadGateway, rr.Code, rr.Body.String())
 	}
-	if loc := rr.Header().Get("Location"); loc != strmURL {
-		t.Errorf("Location 应为原始 STRM URL %q，got %q", strmURL, loc)
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Errorf("失败分支不应设置 Location（旧逻辑 302 回退原 URL），got %q", loc)
+	}
+}
+
+// TestResolveRedirectChain_SelfStrm_ReturnCDN302 回归：
+// FastStrm 自身 /api/strm 端点对「带内部参数 redirect=1 的 HEAD」返回真 302 CDN 时，
+// resolveRedirectChain 应能走出重定向链拿到 CDN URL（普通格式 302 直连 CDN）。
+// 反向：/api/strm 端点对 redirect=1 仅返回 200（决策为 Proxy / 解析失败）时，
+// 结果应规范化回原始 STRM URL，使上层 `finalURL == meta.path` 兜底判断保持成立。
+func TestResolveRedirectChain_SelfStrm_ReturnCDN302(t *testing.T) {
+	cdnsrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "12345")
+		w.Header().Set("Content-Type", "video/x-matroska")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cdnsrv.Close()
+
+	// 命中：/api/strm 对 redirect=1 返回 302 CDN；否则返回 200 probe
+	strmHit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("redirect") == "1" {
+			w.Header().Set("Location", cdnsrv.URL+"/file.mkv")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Length", "12345")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer strmHit.Close()
+
+	emby := mockEmby(t, nil)
+	defer emby.Close()
+	proxy, _ := New(emby.URL)
+
+	req, _ := http.NewRequest("GET", "/Videos/123/stream", nil)
+
+	// 1) redirect=1 命中 → 解析出 CDN URL（且已脱离 /api/strm）
+	hitURL := strmHit.URL + "/api/strm?account=a&pickcode=p"
+	finalURL, status := proxy.resolveRedirectChain(context.Background(), hitURL, req, "u1")
+	if finalURL == hitURL || finalURL == "" {
+		t.Fatalf("redirect=1 命中时应解析出 CDN URL，got %q", finalURL)
+	}
+	if !strings.Contains(finalURL, "/file.mkv") {
+		t.Fatalf("应拿到 CDN 302 目标，got %q", finalURL)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("CDN HEAD 状态码应为 200，got %d", status)
+	}
+
+	// 2) 决策为 Proxy（redirect=1 仍返回 200 probe）→ 规范化回原始 URL
+	strmProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "12345")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer strmProxy.Close()
+	proxyURL := strmProxy.URL + "/api/strm?account=a&pickcode=p"
+	finalURL2, _ := proxy.resolveRedirectChain(context.Background(), proxyURL, req, "u1")
+	if finalURL2 != proxyURL {
+		t.Fatalf("未得到 CDN 302 时应规范化回原始 STRM URL %q，got %q（避免带上 redirect=1）", proxyURL, finalURL2)
 	}
 }
 
